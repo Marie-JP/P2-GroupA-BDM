@@ -137,9 +137,10 @@ def main() -> None:
 
             for _, row in df.iterrows():
                 msg = row.to_dict()
-                # Use VendorID as the partition key so trips from the same
-                # vendor land on the same partition (ordering guarantee).
-                key = str(msg.get("VendorID", ""))
+                # Custom scenario: VendorID -> PULocationID
+                # Use PULocationID as the partition key so trips from the same
+                # pickup location land on the same partition (ordering guarantee).
+                key = str(msg.get("PULocationID", ""))
                 producer.send(args.topic, key=key, value=msg)
                 sent += 1
 

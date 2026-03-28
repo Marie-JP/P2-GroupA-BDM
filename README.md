@@ -80,7 +80,7 @@ Create the Kafka topic (do this once after the stack is up):
 ```bash
 docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 \
-  --create --topic taxi-trips --partitions 3 --replication-factor 1"
+  --create --topic taxi-trips --partitions 6 --replication-factor 1"
 ```
 
 Then open a **Jupyter terminal** (File → New Terminal in JupyterLab) and run:

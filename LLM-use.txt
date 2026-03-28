@@ -1,0 +1,2472 @@
+User: can I just run docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create --topic taxi-trips --partitions 6 --replication-factor 1" to recreate the topic
+
+GitHub Copilot: Yes — that command will create the `taxi-trips` topic when run inside the `kafka` container. A few concise caveats and steps:
+
+- If the topic already exists you’ll get a TopicAlreadyExists error.
+- To fully recreate (drop + create) run (stop producers/consumers first):
+```bash
+docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --delete --topic taxi-trips"
+# wait until deletion completes (check logs / list topics)
+docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create --topic taxi-trips --partitions 6 --replication-factor 1"
+```
+- Note: topic deletion can be disabled in broker config (`delete.topic.enable`). If deletion is disabled, you’ll need to either reuse the existing topic or change broker config and restart.
+- Warning: deleting and recreating removes topic data and consumer offsets. If your Spark bronze job uses a checkpoint directory, either clear/reset the checkpoint or use a new checkpoint before restarting ingestion to avoid duplicate or missing processing.
+- `--partitions 6 --replication-factor 1` is fine for a single-node test setup (as in this repo), but adjust replication if you have a multi-broker cluster.
+
+If you want, I can run the delete+create commands for you (or check whether `taxi-trips` exists now). Which would you like?
+
+User: I have event_schema = "sensor_id STRING, temperature DOUBLE, event_time STRING" that is used in kafka stream parsed_df = (
+    raw_stream
+    .select(
+        F.col("key").cast("string").alias("key"),
+        F.from_json(F.col("value").cast("string"), event_schema).alias("d"),
+        "partition",
+        "offset",
+        F.col("timestamp").alias("kafka_time"),
+    )
+    .select("key", "d.*", "partition", "offset", "kafka_time")
+). Could you create a suitable event_schema for these: VendorID: int, tpep_pickup_datetime: timestamp_ntz, tpep_dropoff_datetime: timestamp_ntz, passenger_count: bigint, trip_distance: double, RatecodeID: bigint, store_and_fwd_flag: string, PULocationID: int, DOLocationID: int, payment_type: bigint, fare_amount: double, extra: double, mta_tax: double, tip_amount: double, tolls_amount: double, improvement_surcharge: double, total_amount: double, congestion_surcharge: double, Airport_fee: double, cbd_congestion_fee: double
+
+GitHub Copilot: I'll add a short two-step todo plan for this small schema task.
+
+Created 2 todos
+
+Progress: plan added and completed. Next: schema + usage snippet.
+
+Suggested `event_schema`:
+
+event_schema = "VendorID INT, tpep_pickup_datetime TIMESTAMP_NTZ, tpep_dropoff_datetime TIMESTAMP_NTZ, passenger_count BIGINT, trip_distance DOUBLE, RatecodeID BIGINT, store_and_fwd_flag STRING, PULocationID INT, DOLocationID INT, payment_type BIGINT, fare_amount DOUBLE, extra DOUBLE, mta_tax DOUBLE, tip_amount DOUBLE, tolls_amount DOUBLE, improvement_surcharge DOUBLE, total_amount DOUBLE, congestion_surcharge DOUBLE, Airport_fee DOUBLE, cbd_congestion_fee DOUBLE"
+
+Usage (replace your `event_schema` string in code):
+
+parsed_df = (
+    raw_stream
+    .select(
+        F.col("key").cast("string").alias("key"),
+        F.from_json(F.col("value").cast("string"), event_schema).alias("d"),
+        "partition",
+        "offset",
+        F.col("timestamp").alias("kafka_time"),
+    )
+    .select("key", "d.*", "partition", "offset", "kafka_time")
+)
+
+If your Spark version doesn't accept `TIMESTAMP_NTZ` in `from_json`, parse those fields as `STRING` and then cast, e.g.:
+
+parsed_df = parsed_df.withColumn("tpep_pickup_datetime", F.to_timestamp("tpep_pickup_datetime")) \
+                     .withColumn("tpep_dropoff_datetime", F.to_timestamp("tpep_dropoff_datetime"))
+
+Want me to update produce.py or a notebook cell with this?
+
+User: Create me a spark.sql CREATE OR REPLACE TABLE query for that table
+
+GitHub Copilot: Adding a short TODO list to track this task, then creating the CREATE TABLE SQL.
+
+Created 2 todos
+
+Use this SQL (run with `spark.sql(...)` in your notebook):
+
+```sql
+CREATE OR REPLACE TABLE lakehouse.taxi.taxi_trips_bronze (
+  VendorID INT,
+  tpep_pickup_datetime TIMESTAMP,
+  tpep_dropoff_datetime TIMESTAMP,
+  passenger_count BIGINT,
+  trip_distance DOUBLE,
+  RatecodeID BIGINT,
+  store_and_fwd_flag STRING,
+  PULocationID INT,
+  DOLocationID INT,
+  payment_type BIGINT,
+  fare_amount DOUBLE,
+  extra DOUBLE,
+  mta_tax DOUBLE,
+  tip_amount DOUBLE,
+  tolls_amount DOUBLE,
+  improvement_surcharge DOUBLE,
+  total_amount DOUBLE,
+  congestion_surcharge DOUBLE,
+  Airport_fee DOUBLE,
+  cbd_congestion_fee DOUBLE,
+  kafka_key STRING,
+  kafka_partition INT,
+  kafka_offset BIGINT,
+  kafka_time TIMESTAMP
+)
+USING iceberg
+```
+
+Quick usage in a notebook cell:
+
+```python
+sql = """<paste the SQL above>"""
+spark.sql(sql)
+```
+
+If you want partitioning (recommended for gold/silver), tell me how you'd like to partition (e.g., by month or day) and I’ll add a partition clause.
+
+User: parsed_df = (
+    raw_stream
+    .select(
+        F.col("key").cast("string").alias("key"),
+        F.col("value"),
+        "partition",
+        "offset",
+        F.col("timestamp").alias("kafka_time"),
+    )
+    .select("key", "value", "partition", "offset", "kafka_time")
+)
+
+parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .queryName("bronze_taxi")
+    .outputMode("complete")            # full table re-emitted every trigger
+    .option("checkpointLocation", "/tmp/chk-taxi-complete")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+
+spark.sql("""
+    SELECT key, value, partition, offset, kafka_time
+    FROM bronze_taxi
+    ORDER BY offset
+""").show(truncate=False) 
+IllegalArgumentException: 'path' is not specified.
+
+GitHub Copilot: I'll add a short TODO list tracking the fix, then show two minimal fixes you can apply (memory sink for interactive SQL, or JSON file sink with path).
+
+Created 2 todos
+
+Progress: TODOs recorded and fixes prepared.
+
+Cause: format("json") is the file sink and requires a `path` option; you cannot query it via `spark.sql` as an in-memory table. Options:
+
+1) Quick interactive fix — write to the memory sink so `spark.sql("SELECT ... FROM bronze_taxi")` works:
+
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("memory")
+    .queryName("bronze_taxi")
+    .outputMode("complete")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+```
+
+2) Persist JSON files (durable) — provide a path and then read the files as a table:
+
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .option("path", "/tmp/bronze_taxi_json")           # required for file sink
+    .option("checkpointLocation", "/tmp/chk-taxi-json")
+    .outputMode("append")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+# Later, to query:
+spark.read.json("/tmp/bronze_taxi_json").createOrReplaceTempView("bronze_taxi")
+spark.sql("SELECT key, value, partition, offset, kafka_time FROM bronze_taxi ORDER BY offset").show(truncate=False)
+```
+
+Recommendation: use the `memory` sink for quick interactive exploration; use the file sink with `.option("path", ...)` (and read it into a table) for durability.
+
+User: 
+AnalysisException: This query does not support recovering from checkpoint location. Delete /tmp/chk-taxi-complete/offsets to start over.
+
+GitHub Copilot: I'll add a short TODO list for the checkpoint fix, then show exact stop/remove/restart commands.
+
+Created 3 todos
+
+Progress: TODOs recorded. Next: stop the stream, delete the offsets, then restart with a safe checkpoint or different sink.
+
+Steps (pick one):
+
+1) Stop running streaming queries from your notebook (run in PySpark / notebook cell):
+```python
+for q in spark.streams.active:
+    print(q.name, q.id, q.isActive)
+    q.stop()
+```
+
+2) Remove the problematic offsets directory (shell or Python). Warning: this discards recoverable state — only do if you want to start over.
+Shell:
+```bash
+ls -la /tmp/chk-taxi-complete
+rm -rf /tmp/chk-taxi-complete/offsets
+```
+Python:
+```python
+import shutil
+shutil.rmtree("/tmp/chk-taxi-complete/offsets", ignore_errors=True)
+```
+
+3) Restart the stream — choose one:
+
+- If you want quick interactive SQL (memory sink — note: memory sink doesn't support recovery; do NOT reuse a checkpoint for it):
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("memory")
+    .queryName("bronze_taxi")
+    .outputMode("complete")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+```
+
+- If you want durable files (file sink) — provide a `path` and a fresh checkpoint:
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .option("path", "/tmp/bronze_taxi_json")
+    .option("checkpointLocation", "/tmp/chk-taxi-json")
+    .outputMode("append")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+```
+Then read into a temp view:
+```python
+spark.read.json("/tmp/bronze_taxi_json").createOrReplaceTempView("bronze_taxi")
+spark.sql("SELECT key, value, partition, offset, kafka_time FROM bronze_taxi ORDER BY offset").show(truncate=False)
+```
+
+Notes:
+- The AnalysisException means the existing checkpoint was for a query type that doesn't support recovery; deleting `/tmp/chk-taxi-complete/offsets` (or using a new checkpoint path) is the fix.
+- Prefer unique checkpoint paths per query or use file sink for durable pipelines. Need help running these steps in your environment? I can run the shell commands if you want.
+
+User: Got it to work. What is the .trigger here: parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .outputMode("append")
+    .option("path",               "/tmp/bronze")
+    .option("checkpointLocation", "/tmp/chk-bronze")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+
+
+GitHub Copilot: I'll explain what `.trigger(...)` does and give short examples and alternatives.
+
+- What it does: `.trigger(processingTime="5 seconds")` tells Spark Structured Streaming to run the query in periodic micro-batches, scheduling a new batch every 5 seconds (equivalent to `Trigger.ProcessingTime("5 seconds")`). The first batch runs as soon as work is available; subsequent batches run at the given interval.
+
+- Programmatic form:
+```python
+from pyspark.sql.streaming import Trigger
+
+parsed_query = (
+    parsed_df.writeStream
+    ...
+    .trigger(Trigger.ProcessingTime("5 seconds"))
+    .start()
+)
+```
+
+- Other useful triggers:
+  - `Trigger.ProcessingTime("N seconds")` — periodic micro-batches (default pattern).
+  - `Trigger.Once()` — run a single micro-batch that processes all available data then stop.
+  - `Trigger.AvailableNow()` — process all currently available data and stop (useful for ingestion catch-up jobs).
+
+- Practical notes:
+  - Shorter intervals → lower latency but higher scheduling/overhead; longer intervals → better throughput.
+  - Checkpointing (`checkpointLocation`) is still required for durable recovery with most sinks.
+  - Use `Trigger.Once()` or `AvailableNow()` for one-off batch-style runs; use `ProcessingTime` for continuous micro-batch streaming.
+
+User: spark.sql("""
+    CREATE OR REPLACE TABLE stg_taxi (
+        value    STRING,
+        kafka_time  TIMESTAMP
+    ) USING iceberg
+""") IllegalArgumentException: Cannot open table: path is not set
+
+GitHub Copilot: I'll update the TODO list to record the Iceberg table fix.
+
+Completed: *Stop active streaming queries* (1/4)
+
+Progress: TODOs updated.
+
+Cause and fixes (concise):
+
+- Cause: creating an Iceberg table without a catalog or LOCATION uses the default Spark catalog which doesn't know where to store Iceberg files — hence "path is not set".
+
+- Fix A — create the table in the configured Iceberg catalog (`lakehouse`) so Iceberg uses the warehouse (MinIO) you configured in README.md:
+```python
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.taxi.stg_taxi (
+  value STRING,
+  kafka_time TIMESTAMP
+) USING iceberg
+""")
+```
+
+- Fix B — explicitly set a location (less recommended here since `lakehouse` already points to the correct S3/MinIO warehouse):
+```python
+spark.sql("""
+CREATE TABLE IF NOT EXISTS stg_taxi (
+  value STRING,
+  kafka_time TIMESTAMP
+) USING iceberg
+LOCATION 's3://warehouse/path/to/stg_taxi'
+""")
+```
+
+- Quick alternative (non-Iceberg staging for fast prototyping): use a temp view instead of an Iceberg table:
+```python
+parsed_df.createOrReplaceTempView("stg_taxi_temp")
+spark.sql("SELECT * FROM stg_taxi_temp").show()
+```
+
+Recommendation: use Fix A (`lakehouse.taxi.stg_taxi`) so Spark/Iceberg writes to MinIO via the `lakehouse` catalog configured in your README.md.
+
+User: Maybe anything wrong with the config S3_ENDPOINT = "http://minio:9000"
+S3_BUCKET   = "s3a://warehouse"
+
+spark = (
+    SparkSession.builder
+    .appName("bdm_week04_lakehouse")
+    .master("local[*]")
+    .config("spark.sql.shuffle.partitions", "4")
+    # ---- S3 / MinIO configuration ----
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
+    .config("spark.hadoop.fs.s3a.access.key", "*")
+    .config("spark.hadoop.fs.s3a.secret.key", "*****")
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")        # required for MinIO
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+    # ---- Iceberg configuration ----
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lakehouse.type", "hadoop")
+    .config("spark.sql.catalog.lakehouse.warehouse", S3_BUCKET)
+    .config("spark.sql.defaultCatalog", "lakehouse")
+    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+GitHub Copilot: I'll point out the issues and show a minimal corrected snippet you can copy into your notebook.
+
+Key issues / recommendations
+- S3 bucket URI: use a proper s3a URI with trailing slash — e.g. `s3a://warehouse/` (your `S3_BUCKET` should be a URI, not just the bucket name).
+- Credentials: avoid hardcoding; read from env (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) or .env.
+- Endpoint: `http://minio:9000` is fine for `fs.s3a.endpoint`. Some users omit the scheme (both work), but include `fs.s3a.connection.ssl.enabled=false` for HTTP.
+- Iceberg catalog type: `hadoop` is OK if you want Iceberg to use Hadoop/S3A FileIO; with `hadoop` the `warehouse` must be an accessible URI (use `s3a://...`). If you prefer the setup in your README, use the `rest` catalog + `S3FileIO` approach instead.
+- Check keys names: `spark.hadoop.fs.s3a.access.key` and `spark.hadoop.fs.s3a.secret.key` are correct; you also set the `aws.credentials.provider` which is fine.
+
+Minimal corrected snippet (recommended)
+```python
+S3_ENDPOINT = "http://minio:9000"
+S3_WAREHOUSE = "s3a://warehouse/"
+
+spark = (
+    SparkSession.builder
+    .appName("bdm_week04_lakehouse")
+    .master("local[*]")
+    .config("spark.sql.shuffle.partitions", "4")
+
+    # S3 / MinIO (read from env instead of hardcoding)
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
+    .config("spark.hadoop.fs.s3a.access.key", os.environ["AWS_ACCESS_KEY_ID"])
+    .config("spark.hadoop.fs.s3a.secret.key", os.environ["AWS_SECRET_ACCESS_KEY"])
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+
+    # Iceberg Hadoop catalog using s3a:// URI
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lakehouse.type", "hadoop")
+    .config("spark.sql.catalog.lakehouse.warehouse", S3_WAREHOUSE)
+    .config("spark.sql.defaultCatalog", "lakehouse")
+    .getOrCreate()
+)
+```
+
+If you prefer the README approach (Iceberg REST + S3FileIO), switch to `type=rest` and configure `lakehouse.io-impl` and MinIO credentials as shown in your README — that is the recommended setup for this project.
+
+User: oops copied wrong config. Correct version: S3_ENDPOINT = "http://minio:9000"
+S3_BUCKET   = "s3a://warehouse"
+
+spark = (
+    SparkSession.builder
+    .appName("project2")
+    .master("local[*]")
+    .config("spark.sql.shuffle.partitions", "4")
+
+    # ── Iceberg ──────────────────────────────────────────────────────────────
+    .config("spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    # Catalog named 'lakehouse' — use it as: lakehouse.<database>.<table>
+    .config("spark.sql.catalog.lakehouse",
+            "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lakehouse.type",      "rest")
+    .config("spark.sql.catalog.lakehouse.uri",       "http://iceberg-rest:8181")
+    .config("spark.sql.catalog.lakehouse.warehouse", S3_BUCKET)
+    # S3FileIO writes data files directly to MinIO
+    .config("spark.sql.catalog.lakehouse.io-impl",
+            "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.lakehouse.s3.endpoint",          S3_ENDPOINT)
+    .config("spark.sql.catalog.lakehouse.s3.path-style-access", "true")
+    .config("spark.sql.catalog.lakehouse.s3.access-key-id",     os.environ["AWS_ACCESS_KEY_ID"])
+    .config("spark.sql.catalog.lakehouse.s3.secret-access-key", os.environ["AWS_SECRET_ACCESS_KEY"])
+    .config("spark.sql.catalog.lakehouse.s3.region", "us-east-1")
+
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+GitHub Copilot: Mostly correct — one tweak:
+
+- When using the REST catalog with `lakehouse.io-impl=org.apache.iceberg.aws.s3.S3FileIO`, the warehouse URI should use the `s3://` scheme (not `s3a://`) and include a trailing slash. Change:
+  - S3_BUCKET = "s3://warehouse/"
+
+Keep the rest as-is (catalog `lakehouse.s3.*` keys, endpoint, and env creds). If instead you want to use Hadoop/S3A FileIO, switch `spark.sql.catalog.lakehouse.type` to `"hadoop"` and use `s3a://` URIs plus the `fs.s3a.*` settings.
+
+Quick verification (run in notebook):
+```python
+spark.sql("CREATE DATABASE IF NOT EXISTS lakehouse.taxi")
+spark.sql("CREATE TABLE IF NOT EXISTS lakehouse.taxi.test (id INT) USING iceberg")
+spark.sql("SHOW TABLES IN lakehouse.taxi").show()
+```
+If those succeed the catalog + S3 config is correct.
+
+User: spark.sql("SHOW TABLES IN lakehouse.taxi").show() does wirj
+
+GitHub Copilot: Quick check — do you see rows returned or an error? If it failed, run these in your notebook and paste the error:
+
+```python
+spark.sql("CREATE TABLE IF NOT EXISTS lakehouse.taxi.test (id INT) USING iceberg")
+spark.sql("SHOW TABLES IN lakehouse.taxi").show()
+```
+
+If that errors, run these diagnostics in a host shell:
+
+```bash
+curl -s http://localhost:8181/health || docker compose logs iceberg-rest --tail 100
+docker compose logs minio --tail 100
+```
+
+Share the exact error output and I’ll suggest the next fix.
+
+User: These did work
+
+GitHub Copilot: Updating the TODOs to add a step for writing the bronze stream to your Iceberg table.
+
+Created 5 todos
+
+Nice — since `lakehouse` works, write the stream directly to the Iceberg table. Example:
+
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("iceberg")
+    .outputMode("append")
+    .option("checkpointLocation", "/tmp/chk-bronze-iceberg")
+    .start("lakehouse.taxi.stg_taxi")
+)
+```
+
+Quick notes:
+- Use a unique `checkpointLocation` per streaming query.
+- Use `append` for Bronze; Iceberg will manage file commits.
+- Verify with:
+```python
+spark.sql("SELECT * FROM lakehouse.taxi.stg_taxi LIMIT 10").show(truncate=False)
+```
+
+Want me to mark the new TODO as completed after you confirm the stream is running?
+
+User: Why is my data saved as .parquet? spark.sql("""
+    CREATE OR REPLACE TABLE lakehouse.bronze.stg_taxi (
+        kafka_time TIMESTAMP,
+        key STRING,
+        offset INT,
+        partition INT,
+        value STRING
+    ) USING iceberg
+""")
+
+raw_df.withColumn("kafka_time", F.to_timestamp("kafka_time")).writeTo("lakehouse.bronze.stg_taxi").append()
+
+GitHub Copilot: That's expected — Iceberg is a metadata/table layer; the actual data is written as columnar files (Parquet by default). `writeTo("lakehouse.bronze.stg_taxi").append()` writes Iceberg data files, and Iceberg chooses Parquet unless you tell it otherwise.
+
+To change the file format for new data, set the table property (on create or alter). Example — create with ORC:
+
+```sql
+CREATE OR REPLACE TABLE lakehouse.bronze.stg_taxi (
+  kafka_time TIMESTAMP,
+  key STRING,
+  offset INT,
+  partition INT,
+  value STRING
+) USING iceberg
+TBLPROPERTIES ('write.format.default'='orc');
+```
+
+Or change an existing table:
+
+```sql
+ALTER TABLE lakehouse.bronze.stg_taxi
+SET TBLPROPERTIES ('write.format.default'='orc');
+```
+
+Notes:
+- Changing the property affects subsequent writes only; existing Parquet files remain.
+- You can use `parquet`, `orc`, or `avro` (depending on your Iceberg/Spark setup).
+- Iceberg manages file layout/commits and stores files in the warehouse path (MinIO/S3) — you’ll see `.parquet` files there when Parquet is selected.
+
+User: But I have this requirement: Bronze table exists and contains raw JSON rows
+
+GitHub Copilot: Short answer: nothing's wrong — Iceberg stores data files as Parquet by default, but the table can still contain raw JSON rows (as a `STRING` column). The requirement "Bronze table exists and contains raw JSON rows" usually means the `value` column holds the original JSON string, not that the warehouse stores `.json` files.
+
+Example (create table → stream writes → verify):
+
+```python
+# create Iceberg bronze table with raw JSON column
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.bronze.stg_taxi (
+  kafka_time TIMESTAMP,
+  key STRING,
+  offset INT,
+  partition INT,
+  value STRING          -- raw JSON stored here
+) USING iceberg
+""")
+
+# streaming write (append) to Iceberg table
+parsed_df = parsed_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+parsed_query = (
+    parsed_df.writeStream
+    .format("iceberg")
+    .outputMode("append")
+    .option("checkpointLocation", "/tmp/chk-bronze-iceberg")
+    .start("lakehouse.bronze.stg_taxi")
+)
+
+# verify the table contains raw JSON strings
+spark.sql("SELECT value FROM lakehouse.bronze.stg_taxi LIMIT 5").show(truncate=False)
+```
+
+If you truly need literal `.json` files in the warehouse (not recommended for Iceberg), write to the JSON file sink instead:
+
+```python
+parsed_df.writeStream.format("json").option("path","/tmp/bronze_json").option("checkpointLocation","/tmp/chk-json").start()
+```
+
+Summary: keep using Iceberg (Parquet files) but ensure the table schema stores the original JSON in the `value` STRING column — that satisfies the requirement. Do you want me to mark the "Write bronze stream to Iceberg table" TODO as completed?
+
+User: 
+
+Make sure that the fields here are cast into correct types. fill nulls for more obvious fields:
+
+silver_df = (
+    spark.table("lakehouse.bronze.stg_taxi")
+    .select(F.from_json("raw_value", taxi_schema).alias("d"))
+    .select(
+        "d.VendorID",
+        "d.RatecodeID",
+        "d.PULocationID",
+        "d.DOLocationID",
+        F.to_timestamp("d.tpep_pickup_datetime").alias("tpep_pickup_datetime"),
+        F.to_timestamp("d.tpep_dropoff_datetime").alias("tpep_dropoff_datetime"),
+        "d.passenger_count",
+        "d.trip_distance",
+        "d.store_and_fwd_flag",
+        "d.payment_type",
+        "d.fare_amount",
+        "d.extra",
+        "d.mta_tax",
+        "d.tip_amount",
+        "d.tolls_amount",
+        "d.improvement_surcharge",
+        "d.total_amount",
+        "d.congestion_surcharge",
+        "d.Airport_fee",
+        "d.cbd_congestion_fee",
+    )
+    .filter(F.col("temperature").isNotNull())
+    .filter(F.col("sensor_id").isNotNull())
+)
+
+taxi_schema = """
+    VendorID INT,
+    tpep_pickup_datetime TIMESTAMP,
+    tpep_dropoff_datetime TIMESTAMP,
+    passenger_count BIGINT,
+    trip_distance DOUBLE,
+    RatecodeID BIGINT,
+    store_and_fwd_flag STRING,
+    PULocationID INT,
+    DOLocationID INT,
+    payment_type BIGINT,
+    fare_amount DOUBLE,
+    extra DOUBLE,
+    mta_tax DOUBLE,
+    tip_amount DOUBLE,
+    tolls_amount DOUBLE,
+    improvement_surcharge DOUBLE,
+    total_amount DOUBLE,
+    congestion_surcharge DOUBLE,
+    Airport_fee DOUBLE,
+    cbd_congestion_fee DOUBLE
+"""
+
+
+GitHub Copilot: I'll search the repo for the `silver_df` definition and taxi schema to update types and null-filling.
+
+Searched for text `silver_df = (`, 3 results
+
+Read [](file:///home/marie/big-data-management-2026/project_2/week_04_practice.ipynb#860-860), lines 860 to 860
+
+Searched for text `taxi_schema`, 3 results
+
+Next I'll create a short TODO plan for the changes I'll propose.
+
+Created 3 todos
+
+Now I'll mark the plan steps completed.
+
+Completed: *Create/return corrected Spark code* (1/3)
+
+Use this corrected PySpark snippet — it casts fields to the right types, fills obvious nulls with sensible defaults, and ensures timestamps are parsed and required timestamps exist:
+
+from pyspark.sql import functions as F, types as T
+
+taxi_schema = T.StructType([
+    T.StructField("VendorID", T.IntegerType()),
+    T.StructField("tpep_pickup_datetime", T.TimestampType()),
+    T.StructField("tpep_dropoff_datetime", T.TimestampType()),
+    T.StructField("passenger_count", T.IntegerType()),
+    T.StructField("trip_distance", T.DoubleType()),
+    T.StructField("RatecodeID", T.IntegerType()),
+    T.StructField("store_and_fwd_flag", T.StringType()),
+    T.StructField("PULocationID", T.IntegerType()),
+    T.StructField("DOLocationID", T.IntegerType()),
+    T.StructField("payment_type", T.IntegerType()),
+    T.StructField("fare_amount", T.DoubleType()),
+    T.StructField("extra", T.DoubleType()),
+    T.StructField("mta_tax", T.DoubleType()),
+    T.StructField("tip_amount", T.DoubleType()),
+    T.StructField("tolls_amount", T.DoubleType()),
+    T.StructField("improvement_surcharge", T.DoubleType()),
+    T.StructField("total_amount", T.DoubleType()),
+    T.StructField("congestion_surcharge", T.DoubleType()),
+    T.StructField("Airport_fee", T.DoubleType()),
+    T.StructField("cbd_congestion_fee", T.DoubleType()),
+])
+
+silver_df = (
+    spark.table("lakehouse.bronze.stg_taxi")
+    .select(F.from_json("raw_value", taxi_schema).alias("d"))
+    .select(
+        F.col("d.VendorID").cast("int").alias("VendorID"),
+        F.col("d.RatecodeID").cast("int").alias("RatecodeID"),
+        F.col("d.PULocationID").cast("int").alias("PULocationID"),
+        F.col("d.DOLocationID").cast("int").alias("DOLocationID"),
+        F.to_timestamp(F.col("d.tpep_pickup_datetime")).alias("tpep_pickup_datetime"),
+        F.to_timestamp(F.col("d.tpep_dropoff_datetime")).alias("tpep_dropoff_datetime"),
+        F.col("d.passenger_count").cast("int").alias("passenger_count"),
+        F.col("d.trip_distance").cast("double").alias("trip_distance"),
+        F.col("d.store_and_fwd_flag").cast("string").alias("store_and_fwd_flag"),
+        F.col("d.payment_type").cast("int").alias("payment_type"),
+        F.col("d.fare_amount").cast("double").alias("fare_amount"),
+        F.col("d.extra").cast("double").alias("extra"),
+        F.col("d.mta_tax").cast("double").alias("mta_tax"),
+        F.col("d.tip_amount").cast("double").alias("tip_amount"),
+        F.col("d.tolls_amount").cast("double").alias("tolls_amount"),
+        F.col("d.improvement_surcharge").cast("double").alias("improvement_surcharge"),
+        F.col("d.total_amount").cast("double").alias("total_amount"),
+        F.col("d.congestion_surcharge").cast("double").alias("congestion_surcharge"),
+        F.col("d.Airport_fee").cast("double").alias("Airport_fee"),
+        F.col("d.cbd_congestion_fee").cast("double").alias("cbd_congestion_fee"),
+    )
+    .filter(F.col("tpep_pickup_datetime").isNotNull() & F.col("tpep_dropoff_datetime").isNotNull())
+    .na.fill(
+        {
+            "VendorID": 0,
+            "RatecodeID": 0,
+            "PULocationID": -1,
+            "DOLocationID": -1,
+            "passenger_count": 0,
+            "trip_distance": 0.0,
+            "store_and_fwd_flag": "N",
+            "payment_type": 0,
+            "fare_amount": 0.0,
+            "extra": 0.0,
+            "mta_tax": 0.0,
+            "tip_amount": 0.0,
+            "tolls_amount": 0.0,
+            "improvement_surcharge": 0.0,
+            "total_amount": 0.0,
+            "congestion_surcharge": 0.0,
+            "Airport_fee": 0.0,
+            "cbd_congestion_fee": 0.0,
+        }
+    )
+)
+
+Want me to apply this change directly into week_04_practice.ipynb or another file?
+
+User: How do I join data from zones = spark.read.parquet("data/taxi_zone_lookup.parquet")
+
+GitHub Copilot: I'll show a concise PySpark snippet to join `zones` to `silver_df` for both pickup and dropoff lookups.
+
+```python
+from pyspark.sql import functions as F
+
+zones = spark.read.parquet("data/taxi_zone_lookup.parquet").select(
+    F.col("LocationID").cast("int").alias("LocationID"),
+    F.col("Zone"),
+    F.col("Borough"),
+    F.col("service_zone")
+)
+
+z_pu = zones.alias("z_pu")
+z_do = zones.alias("z_do")
+s = silver_df.alias("s")
+
+silver_enriched = (
+    s
+    .join(F.broadcast(z_pu), F.col("s.PULocationID") == F.col("z_pu.LocationID"), "left")
+    .join(F.broadcast(z_do), F.col("s.DOLocationID") == F.col("z_do.LocationID"), "left")
+    .select(
+        F.col("s.*"),
+        F.col("z_pu.Zone").alias("PU_Zone"),
+        F.col("z_pu.Borough").alias("PU_Borough"),
+        F.col("z_pu.service_zone").alias("PU_service_zone"),
+        F.col("z_do.Zone").alias("DO_Zone"),
+        F.col("z_do.Borough").alias("DO_Borough"),
+        F.col("z_do.service_zone").alias("DO_service_zone"),
+    )
+)
+# optional: fill missing zone names
+silver_enriched = silver_enriched.fillna({"PU_Zone": "Unknown", "DO_Zone": "Unknown"})
+```
+
+Notes:
+- Cast join keys to the same type (we cast `LocationID` to `int`).
+- Use `broadcast()` if `zones` is small (recommended for lookup tables). 
+- Change join type to `"inner"` if you only want rows with matching zones.
+
+User: Based on this: silver_df = (
+    spark.table("lakehouse.bronze.stg_taxi")
+    .select(F.from_json("value", taxi_schema).alias("d"))
+    .select(
+        F.col("d.VendorID").cast("int").alias("VendorID"),
+        F.col("d.RatecodeID").cast("int").alias("RatecodeID"),
+        F.col("d.PULocationID").cast("int").alias("PULocationID"),
+        F.col("d.DOLocationID").cast("int").alias("DOLocationID"),
+        F.to_timestamp(F.col("d.tpep_pickup_datetime")).alias("tpep_pickup_datetime"),
+        F.to_timestamp(F.col("d.tpep_dropoff_datetime")).alias("tpep_dropoff_datetime"),
+        F.col("d.passenger_count").cast("int").alias("passenger_count"),
+        F.col("d.trip_distance").cast("double").alias("trip_distance"),
+        F.col("d.store_and_fwd_flag").cast("string").alias("store_and_fwd_flag"),
+        F.col("d.payment_type").cast("int").alias("payment_type"),
+        F.col("d.fare_amount").cast("double").alias("fare_amount"),
+        F.col("d.extra").cast("double").alias("extra"),
+        F.col("d.mta_tax").cast("double").alias("mta_tax"),
+        F.col("d.tip_amount").cast("double").alias("tip_amount"),
+        F.col("d.tolls_amount").cast("double").alias("tolls_amount"),
+        F.col("d.improvement_surcharge").cast("double").alias("improvement_surcharge"),
+        F.col("d.total_amount").cast("double").alias("total_amount"),
+        F.col("d.congestion_surcharge").cast("double").alias("congestion_surcharge"),
+        F.col("d.Airport_fee").cast("double").alias("Airport_fee"),
+        F.col("d.cbd_congestion_fee").cast("double").alias("cbd_congestion_fee"),
+    )
+    .na.fill({
+        "passenger_count": 1,
+        "trip_distance": 0.0,
+        "store_and_fwd_flag": "N",
+        "payment_type": 0,
+        "fare_amount": 0.0,
+        "extra": 0.0,
+        "mta_tax": 0.0,
+        "tip_amount": 0.0,
+        "tolls_amount": 0.0,
+        "improvement_surcharge": 0.0,
+        "total_amount": 0.0,
+        "congestion_surcharge": 0.0,
+        "Airport_fee": 0.0,
+        "cbd_congestion_fee": 0.0,
+        }
+    )
+)
+
+# joining in the zones
+zones = spark.read.parquet("data/taxi_zone_lookup.parquet").select(
+    F.col("LocationID").cast("int").alias("LocationID"),
+    F.col("Zone"),
+    F.col("Borough"),
+    F.col("service_zone")
+)
+
+z_pu = zones.alias("z_pu")
+z_do = zones.alias("z_do")
+s = silver_df.alias("s")
+
+silver_enriched = (
+    s
+    .join(F.broadcast(z_pu), F.col("s.PULocationID") == F.col("z_pu.LocationID"), "left")
+    .join(F.broadcast(z_do), F.col("s.DOLocationID") == F.col("z_do.LocationID"), "left")
+    .select(
+        F.col("s.*"),
+        F.col("z_pu.Zone").alias("PU_Zone"),
+        F.col("z_pu.Borough").alias("PU_Borough"),
+        F.col("z_pu.service_zone").alias("PU_service_zone"),
+        F.col("z_do.Zone").alias("DO_Zone"),
+        F.col("z_do.Borough").alias("DO_Borough"),
+        F.col("z_do.service_zone").alias("DO_service_zone"),
+    )
+) create a CREATE OR REPLACE TABLE statement
+
+GitHub Copilot: I'll add a short TODO for generating the DDL and mark it done.
+
+Created 1 todo
+
+Progress: TODO recorded and completed. Next: SQL DDL and a small PySpark write example.
+
+- CREATE OR REPLACE TABLE (explicit schema)
+```
+CREATE OR REPLACE TABLE lakehouse.silver.taxi_enriched (
+  VendorID INT,
+  RatecodeID INT,
+  PULocationID INT,
+  DOLocationID INT,
+  tpep_pickup_datetime TIMESTAMP,
+  tpep_dropoff_datetime TIMESTAMP,
+  passenger_count INT,
+  trip_distance DOUBLE,
+  store_and_fwd_flag STRING,
+  payment_type INT,
+  fare_amount DOUBLE,
+  extra DOUBLE,
+  mta_tax DOUBLE,
+  tip_amount DOUBLE,
+  tolls_amount DOUBLE,
+  improvement_surcharge DOUBLE,
+  total_amount DOUBLE,
+  congestion_surcharge DOUBLE,
+  Airport_fee DOUBLE,
+  cbd_congestion_fee DOUBLE,
+  PU_Zone STRING,
+  PU_Borough STRING,
+  PU_service_zone STRING,
+  DO_Zone STRING,
+  DO_Borough STRING,
+  DO_service_zone STRING
+)
+USING DELTA;
+```
+
+- Or create from the DataFrame (PySpark):
+```python
+# overwrite metastore table from silver_enriched DataFrame
+silver_enriched.write.format("delta").mode("overwrite").saveAsTable("lakehouse.silver.taxi_enriched")
+```
+
+Want me to apply this in a notebook cell in week_04_practice.ipynb?
+
+User: Does it write to an iceberg table?
+
+GitHub Copilot: Short answer: No — the example writes a Delta table (`format("delta")` / `USING DELTA`). To write Iceberg you must use Iceberg as the table format and have an Iceberg catalog configured.
+
+Examples:
+
+- DDL
+```sql
+CREATE OR REPLACE TABLE my_catalog.db.taxi_enriched (
+  VendorID INT, RatecodeID INT, PULocationID INT, DOLocationID INT,
+  tpep_pickup_datetime TIMESTAMP, tpep_dropoff_datetime TIMESTAMP,
+  passenger_count INT, trip_distance DOUBLE, store_and_fwd_flag STRING,
+  payment_type INT, fare_amount DOUBLE, extra DOUBLE, mta_tax DOUBLE,
+  tip_amount DOUBLE, tolls_amount DOUBLE, improvement_surcharge DOUBLE,
+  total_amount DOUBLE, congestion_surcharge DOUBLE, Airport_fee DOUBLE,
+  cbd_congestion_fee DOUBLE, PU_Zone STRING, PU_Borough STRING,
+  PU_service_zone STRING, DO_Zone STRING, DO_Borough STRING,
+  DO_service_zone STRING
+) USING ICEBERG;
+```
+
+- PySpark (catalog-backed Iceberg)
+```python
+# if `my_catalog` is configured for Iceberg
+silver_enriched.writeTo("my_catalog.db.taxi_enriched").createOrReplace()
+```
+
+- PySpark (file-backed Iceberg, registers in catalog depending on config)
+```python
+silver_enriched.write.format("iceberg").mode("overwrite").save("s3://.../path/taxi_enriched")
+# or saveAsTable if your Spark catalog is Iceberg:
+silver_enriched.write.format("iceberg").mode("overwrite").saveAsTable("my_catalog.db.taxi_enriched")
+```
+
+Notes: you need an Iceberg catalog (Hive/REST/Nessie/Glue) and proper Spark config/plugins. Want me to change the notebook to write an Iceberg table and, if so, which catalog name should I use?
+
+User: but there is USING iceberg in the CREATE TABLE query
+
+GitHub Copilot: Yes — provided your Spark session has Iceberg support and an Iceberg catalog configured, `CREATE ... USING ICEBERG` will create an Iceberg table.
+
+- Requirements: Iceberg jars/plugins on Spark, and a configured catalog (e.g. `my_iceberg_cat` or configured `spark_catalog`) pointing to Hive/Glue/Nessie/REST.
+- Verify provider after create:
+```python
+spark.sql("DESCRIBE TABLE EXTENDED my_catalog.db.taxi_enriched").show(truncate=False)
+# look for Provider: iceberg (or table properties indicating iceberg)
+```
+- Example DDL (catalog-backed):
+```sql
+CREATE OR REPLACE TABLE my_iceberg_cat.db.taxi_enriched
+USING ICEBERG
+AS SELECT * FROM temp_view_of_silver_enriched;
+```
+- Example PySpark write (catalog-backed):
+```python
+# if `my_iceberg_cat` is configured as an Iceberg catalog
+silver_enriched.writeTo("my_iceberg_cat.db.taxi_enriched").createOrReplace()
+```
+- Example file-path write (less common; still needs Iceberg engine support):
+```python
+silver_enriched.write.format("iceberg").mode("overwrite").save("s3://.../path/taxi_enriched")
+```
+
+If you want, I can:
+- Update your notebook to write `silver_enriched` into an Iceberg table using your preferred catalog name, or
+- Add a verification cell that shows the table provider and properties. Which would you like?
+
+User: How to extract the PUlocationID from value json col in this query: SELECT * FROM lakehouse.bronze.stg_taxi
+    WHERE key = 42
+
+GitHub Copilot: Two options — quick string-extraction or parse to a struct.
+
+1) get_json_object (simple, returns string — cast to int)
+```sql
+SELECT
+  CAST(get_json_object(value, '$.PULocationID') AS INT) AS PULocationID
+FROM `lakehouse.bronze.stg_taxi`
+WHERE key = 42;
+```
+
+2) from_json (parse into a struct, safer if you need multiple fields)
+```sql
+SELECT
+  from_json(value, 'struct<PULocationID:int>').PULocationID AS PULocationID
+FROM `lakehouse.bronze.stg_taxi`
+WHERE key = 42;
+```
+
+Notes: JSON path is case-sensitive; `get_json_object` returns string (cast if needed). Want me to insert one of these into week_04_practice.ipynb?
+
+User: From this table: CREATE OR REPLACE TABLE lakehouse.silver.fct_taxi_trip (
+        VendorID INT,
+        RatecodeID INT,
+        PULocationID INT,
+        DOLocationID INT,
+        tpep_pickup_datetime TIMESTAMP,
+        tpep_dropoff_datetime TIMESTAMP,
+        passenger_count INT,
+        trip_distance DOUBLE,
+        store_and_fwd_flag STRING,
+        payment_type INT,
+        fare_amount DOUBLE,
+        extra DOUBLE,
+        mta_tax DOUBLE,
+        tip_amount DOUBLE,
+        tolls_amount DOUBLE,
+        improvement_surcharge DOUBLE,
+        total_amount DOUBLE,
+        congestion_surcharge DOUBLE,
+        Airport_fee DOUBLE,
+        cbd_congestion_fee DOUBLE,
+        PU_Zone STRING,
+        PU_Borough STRING,
+        PU_service_zone STRING,
+        DO_Zone STRING,
+        DO_Borough STRING,
+        DO_service_zone STRING
+    ) USING iceberg; Create this table: spark.sql(f"""
+    CREATE OR REPLACE TABLE lakehouse.gold.analytical_taxi_trips (
+        tpep_pickup_datetime TIMESTAMP,
+        tpep_dropoff_datetime TIMESTAMP,
+        PU_Zone STRING,
+        PU_Borough STRING,
+        PU_service_zone STRING,
+        total_fee DOUBLE,
+        average_trip_duration_minutes INT
+    ) USING iceberg
+""")
+
+GitHub Copilot: Adding a short TODO to record the CTAS creation for the analytical Iceberg table.
+
+Created 2 todos
+
+Use this CTAS — it creates the Iceberg table and computes `total_fee` and trip duration (minutes as an integer):
+
+```python
+spark.sql("""
+CREATE OR REPLACE TABLE lakehouse.gold.analytical_taxi_trips
+USING ICEBERG
+AS
+SELECT
+  tpep_pickup_datetime,
+  tpep_dropoff_datetime,
+  PU_Zone,
+  PU_Borough,
+  PU_service_zone,
+  COALESCE(total_amount,
+    fare_amount + extra + mta_tax + tip_amount + tolls_amount + improvement_surcharge + congestion_surcharge + Airport_fee + cbd_congestion_fee
+  ) AS total_fee,
+  CAST(ROUND((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime)) / 60.0) AS INT) AS average_trip_duration_minutes
+FROM lakehouse.silver.fct_taxi_trip
+WHERE tpep_pickup_datetime IS NOT NULL
+  AND tpep_dropoff_datetime IS NOT NULL
+""")
+```
+
+This will create an Iceberg table if your Spark session has Iceberg support and an Iceberg catalog configured.
+
+User: How to make this division 0 safe ROUND(avg(total_fee / trip_duration_minutes), 2) AS avg_minute_fee
+
+GitHub Copilot: Showing two safe options — SQL and PySpark.
+
+SQL:
+```sql
+ROUND(
+  AVG( `total_fee` / NULLIF(`trip_duration_minutes`, 0) ),
+  2
+) AS avg_minute_fee
+```
+
+PySpark (expr):
+```python
+from pyspark.sql import functions as F
+
+silver_df.select(
+  F.round(
+    F.avg(F.expr("total_fee / NULLIF(trip_duration_minutes, 0)")),
+    2
+  ).alias("avg_minute_fee")
+)
+```
+
+PySpark (Column API):
+```python
+silver_df.select(
+  F.round(
+    F.avg(
+      F.when(F.col("trip_duration_minutes") == 0, None)
+       .otherwise(F.col("total_fee") / F.col("trip_duration_minutes"))
+    ),
+    2
+  ).alias("avg_minute_fee")
+)
+```
+
+User: How to apply a partitioning strat here: spark.sql("""
+    CREATE OR REPLACE TABLE lakehouse.gold.analytical_taxi_trips
+    USING ICEBERG
+    AS
+    SELECT
+      tpep_pickup_datetime,
+      tpep_dropoff_datetime,
+      PU_Zone,
+      PU_Borough,
+      PU_service_zone,
+      COALESCE(total_amount,
+        fare_amount + extra + mta_tax + tip_amount + tolls_amount + improvement_surcharge + congestion_surcharge + Airport_fee + cbd_congestion_fee
+      ) AS total_fee,
+      CAST(ROUND((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime)) / 60.0) AS INT) AS trip_duration_minutes
+    FROM lakehouse.silver.fct_taxi_trip
+    WHERE tpep_pickup_datetime IS NOT NULL
+      AND tpep_dropoff_datetime IS NOT NULL
+""")
+
+GitHub Copilot: I'll add a short TODO then produce a few partitioned CTAS examples and recommendations.
+
+Created 2 todos
+
+Examples — pick one strategy and run via `spark.sql(...)`.
+
+1) Partition by pickup month (good for monthly analytical queries):
+```sql
+CREATE OR REPLACE TABLE lakehouse.gold.analytical_taxi_trips
+USING ICEBERG
+PARTITIONED BY (months(tpep_pickup_datetime))
+AS
+SELECT
+  tpep_pickup_datetime,
+  tpep_dropoff_datetime,
+  PU_Zone,
+  PU_Borough,
+  PU_service_zone,
+  COALESCE(total_amount,
+    fare_amount + extra + mta_tax + tip_amount + tolls_amount + improvement_surcharge + congestion_surcharge + Airport_fee + cbd_congestion_fee
+  ) AS total_fee,
+  CAST(ROUND((unix_timestamp(tpep_dropoff_datetime) - unix_timestamp(tpep_pickup_datetime)) / 60.0) AS INT) AS trip_duration_minutes
+FROM lakehouse.silver.fct_taxi_trip
+WHERE tpep_pickup_datetime IS NOT NULL
+  AND tpep_dropoff_datetime IS NOT NULL;
+```
+
+2) Partition by month + bucket PU_Zone to handle high-cardinality zones and skew:
+```sql
+CREATE OR REPLACE TABLE lakehouse.gold.analytical_taxi_trips
+USING ICEBERG
+PARTITIONED BY (months(tpep_pickup_datetime), bucket(16, PU_Zone))
+AS
+SELECT ...
+FROM lakehouse.silver.fct_taxi_trip
+WHERE ...;
+```
+
+3) Partition by day (finer-grained, larger number of partitions — useful for time-range deletes/compaction):
+```sql
+PARTITIONED BY (days(tpep_pickup_datetime))
+```
+
+Recommendations (short):
+- Use a time transform (days/months) for time-based querying and pruning.
+- Avoid raw high-cardinality columns (like `PU_Zone`) — use `bucket(N, col)` or `truncate(col, N)` to reduce partitions.
+- Choose granularity by expected query patterns and data volume (months for coarse, days for fine).
+- After creation, verify with `DESCRIBE TABLE EXTENDED lakehouse.gold.analytical_taxi_trips` to inspect partition spec.
+
+Would you like me to insert one of these CTAS variants into week_04_practice.ipynb?
+
+User: event_schema = "VendorID INT, tpep_pickup_datetime TIMESTAMP_NTZ, tpep_dropoff_datetime TIMESTAMP_NTZ, passenger_count BIGINT, trip_distance DOUBLE, RatecodeID BIGINT, store_and_fwd_flag STRING, PULocationID INT, DOLocationID INT, payment_type BIGINT, fare_amount DOUBLE, extra DOUBLE, mta_tax DOUBLE, tip_amount DOUBLE, tolls_amount DOUBLE, improvement_surcharge DOUBLE, total_amount DOUBLE, congestion_surcharge DOUBLE, Airport_fee DOUBLE, cbd_congestion_fee DOUBLE"
+parsed_df = (
+    raw_stream
+    .select(
+        F.col("key").cast("string").alias("key"),
+        F.from_json(F.col("value").cast("string"), event_schema).alias("d"),
+        "partition",
+        "offset",
+        F.col("timestamp").alias("kafka_time"),
+    )
+    .select("key", "d.*", "partition", "offset", "kafka_time")
+)
+
+print("Parsed schema:")
+parsed_df.printSchema()
+
+Does this architecture make sense?
+
+raw_stream = (
+    spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", BOOTSTRAP)
+    .option("subscribe", TOPIC)
+    .option("startingOffsets", "earliest")
+    .load()
+)
+
+parsed_df = (
+    raw_stream
+    .select(
+        F.col("key").cast("string").alias("key"),
+        F.col("value").cast("string").alias("value"),
+        "partition",
+        "offset",
+        F.col("timestamp").alias("kafka_time"),
+    )
+    .select("key", "value", "partition", "offset", "kafka_time")
+)
+
+parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .outputMode("append")
+    .option("path",               "/tmp/ingestion/taxi")
+    .option("checkpointLocation", "/tmp/chk-ingestion")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+
+#time.sleep(15)
+raw_df = spark.read.json("/tmp/ingestion/taxi")
+raw_df.show(5)
+parsed_query.stop()
+
+
+spark.sql("""
+    CREATE OR REPLACE TABLE lakehouse.bronze.stg_taxi (
+        kafka_time TIMESTAMP,
+        key STRING,
+        offset INT,
+        partition INT,
+        value STRING
+    ) USING iceberg
+""")
+
+raw_df.withColumn("kafka_time", F.to_timestamp("kafka_time")).writeTo("lakehouse.bronze.stg_taxi").append()
+
+GitHub Copilot: I'll add a short TODO list for this review and improvements, then summarize suggestions and a concise code example.
+
+Created 2 todos
+
+Summary — short answer
+- Yes, the high-level architecture is sensible (Kafka → Spark Structured Streaming → persist).  
+- Improvements: avoid intermediate JSON files, use proper Spark schema types, write streaming directly to Iceberg (or use foreachBatch), handle parsing failures and timezones, and use checkpointing for exactly-once.
+
+Key issues & recommendations
+- Schema type: `TIMESTAMP_NTZ` is not a Spark DataType. Use Spark `TimestampType` (or build a `StructType`) instead of vendor-specific types. Build the schema with a `StructType` to avoid ambiguity.
+- from_json schema: pass a `StructType` (or DDL wrapped in `struct<...>`) to `F.from_json` to ensure correct typing.
+- Don’t write streaming Kafka -> JSON files -> static read -> write to Iceberg in production: it’s brittle (partial files, race conditions, many small files). Instead:
+  - Write streaming directly into Iceberg (if supported by your Spark/Iceberg combo) via a streaming sink, or
+  - Use `foreachBatch` to perform transactional writes to Iceberg per micro-batch (recommended if Iceberg sink integration isn't available).
+- Checkpointing: you already set a checkpoint for JSON sink — keep a checkpoint when writing to Iceberg too (for streaming sinks). For `foreachBatch`, still use `writeStream(...).option("checkpointLocation", ...)`.
+- Parsing safety: `F.from_json` returns null on parse errors — filter or log malformed rows; consider `F.from_json(..., schema, {"mode":"PERMISSIVE"})` or check `isnull`.
+- Kafka metadata: reading `partition`, `offset`, `timestamp` is fine; cast types explicitly if needed.
+- File format: prefer `parquet` or Iceberg-managed files over raw JSON for performance and schema evolution.
+- Timezones/timestamps: ensure `kafka_time` uses proper timezone conversion (`F.to_timestamp`) and that Iceberg table column type is `TIMESTAMP` (without vendor suffixes).
+
+Minimal example: use `StructType` + `foreachBatch` to write to Iceberg
+- Use a StructType for `event_schema`.
+- Use `foreachBatch` to write each micro-batch to Iceberg transactionally.
+
+Example (concise):
+
+- Build schema:
+`from pyspark.sql.types import StructType, StructField, IntegerType, TimestampType, LongType, DoubleType, StringType`
+`event_schema = StructType([...])  # use appropriate types, e.g. StructField('tpep_pickup_datetime', TimestampType()), ...`
+
+- Read Kafka and parse:
+```
+raw_stream = (
+    spark.readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", BOOTSTRAP)
+      .option("subscribe", TOPIC)
+      .option("startingOffsets", "earliest")
+      .load()
+)
+
+parsed_df = raw_stream.select(
+    F.col("key").cast("string").alias("key"),
+    F.from_json(F.col("value").cast("string"), event_schema).alias("d"),
+    F.col("partition").cast("int"),
+    F.col("offset").cast("long"),
+    F.col("timestamp").alias("kafka_time")
+).select("key", "d.*", "partition", "offset", "kafka_time")
+```
+
+- Stream -> Iceberg via foreachBatch:
+```
+def write_to_iceberg(batch_df, batch_id):
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    batch_df.writeTo("lakehouse.bronze.stg_taxi").append()
+
+query = (
+    parsed_df.writeStream
+      .foreachBatch(write_to_iceberg)
+      .option("checkpointLocation", "/tmp/chk-iceberg")
+      .trigger(processingTime="5 seconds")
+      .start()
+)
+```
+
+Alternative: if Iceberg streaming sink is supported in your Spark version:
+```
+parsed_df.writeStream \
+  .format("iceberg") \
+  .outputMode("append") \
+  .option("checkpointLocation", "/tmp/chk-iceberg") \
+  .start("lakehouse.bronze.stg_taxi")
+```
+
+Other tips
+- For aggregations, add `withWatermark(...)` to handle late data.
+- For production, avoid `startingOffsets="earliest"` unless deliberate; use group offsets management and monitoring.
+- Validate `value` shape: drop or route malformed messages for debugging:
+`parsed_df.filter(F.col("d").isNull()).writeStream...` to inspect bad messages.
+- Consider schema evolution strategy (Iceberg handles evolution well).
+
+If you want, I can:
+- Convert your `event_schema` DDL into a `StructType`.
+- Provide a ready-to-run `foreachBatch` snippet wired to your table and checkpoint paths.
+Which would you like me to do next?
+
+User: How is this: # Reading from Kafka
+BOOTSTRAP = "kafka:9092"
+TOPIC     = "taxi-trips"
+
+raw_stream = (
+    spark.readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", BOOTSTRAP)
+      .option("subscribe", TOPIC)
+      .option("startingOffsets", "earliest")
+      .load()
+)
+
+parsed_df = raw_stream.select(
+    F.col("key").cast("string").alias("key"),
+    F.col("value").cast("string").alias("value"),
+    F.col("partition").cast("int"),
+    F.col("offset").cast("long"),
+    F.col("timestamp").alias("kafka_time")
+).select("key", "value", "partition", "offset", "kafka_time")
+
+
+def write_to_iceberg(batch_df, batch_id):
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    batch_df.writeTo("lakehouse.bronze.stg_taxi").append()
+
+query = (
+    parsed_df.writeStream
+      .foreachBatch(write_to_iceberg)
+      .option("checkpointLocation", "/tmp/chk-iceberg")
+      .trigger(processingTime="5 seconds")
+      .start()
+)
+
+GitHub Copilot: I'm adding a short TODO list to track review, improvements, and a code example.
+
+Created 3 todos
+
+Progress: TODOs added. Next: concise review and an improved snippet you can run.
+
+Quick review (concise)
+- Good: Kafka → Spark structured streaming → Iceberg via `foreachBatch` is a solid approach for transactional writes.
+- Fixes needed: parse `value` into columns with a proper Spark `StructType` (don't rely on vendor types like `TIMESTAMP_NTZ`), handle malformed rows, keep checkpointing, and ensure table schema matches parsed columns.
+
+Minimal, production-ready suggestions
+- Build a `StructType` for the event schema (use `TimestampType`, `IntegerType`, `LongType`, `DoubleType`, `StringType`).
+- Parse `value` with `F.from_json(..., event_schema)` so columns are typed.
+- Filter or route rows where parsing failed (`d IS NULL`) for later inspection.
+- Keep checkpointing and set `startingOffsets` appropriately for prod (`latest` usually).
+- Ensure `lakehouse.bronze.stg_taxi` exists with compatible schema (or create it beforehand).
+- Use `batch_df.writeTo(...).append()` inside `foreachBatch` — this is fine if your Spark/Iceberg versions support it.
+
+Concise runnable example (replace BOOTSTRAP/TOPIC/paths as needed):
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, LongType, DoubleType, StringType, TimestampType
+)
+
+BOOTSTRAP = "kafka:9092"
+TOPIC = "taxi-trips"
+
+event_schema = StructType([
+    StructField("VendorID", IntegerType()),
+    StructField("tpep_pickup_datetime", TimestampType()),
+    StructField("tpep_dropoff_datetime", TimestampType()),
+    StructField("passenger_count", LongType()),
+    StructField("trip_distance", DoubleType()),
+    StructField("RatecodeID", LongType()),
+    StructField("store_and_fwd_flag", StringType()),
+    StructField("PULocationID", IntegerType()),
+    StructField("DOLocationID", IntegerType()),
+    StructField("payment_type", LongType()),
+    StructField("fare_amount", DoubleType()),
+    StructField("extra", DoubleType()),
+    StructField("mta_tax", DoubleType()),
+    StructField("tip_amount", DoubleType()),
+    StructField("tolls_amount", DoubleType()),
+    StructField("improvement_surcharge", DoubleType()),
+    StructField("total_amount", DoubleType()),
+    StructField("congestion_surcharge", DoubleType()),
+    StructField("Airport_fee", DoubleType()),
+    StructField("cbd_congestion_fee", DoubleType())
+])
+
+raw_stream = (
+    spark.readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", BOOTSTRAP)
+      .option("subscribe", TOPIC)
+      .option("startingOffsets", "earliest")  # change to "latest" for prod
+      .load()
+)
+
+parsed_df = (
+    raw_stream.select(
+        F.col("key").cast("string").alias("key"),
+        F.from_json(F.col("value").cast("string"), event_schema).alias("d"),
+        F.col("partition").cast("int"),
+        F.col("offset").cast("long"),
+        F.col("timestamp").alias("kafka_time")
+    )
+    .select("key", "d.*", "partition", "offset", "kafka_time")
+)
+
+def write_to_iceberg(batch_df, batch_id):
+    # route/inspect malformed rows
+    bad = batch_df.filter(F.col("tpep_pickup_datetime").isNull())
+    if bad.take(1):
+        bad.write.mode("append").parquet("/tmp/ingestion/bad_messages")  # or log elsewhere
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    batch_df.writeTo("lakehouse.bronze.stg_taxi").append()
+
+query = (
+    parsed_df.writeStream
+      .foreachBatch(write_to_iceberg)
+      .option("checkpointLocation", "/tmp/chk-iceberg")
+      .trigger(processingTime="5 seconds")
+      .start()
+)
+
+If you want, I can:
+- Convert your original DDL string exactly into a `StructType` file and drop it into produce.py or a helper module, and/or
+- Add a small helper to route malformed messages to a debug Iceberg table or S3/parquet path.
+
+Which of those should I do next?
+
+User: The json is a requirement. any ways to display how many rows have been ingested and maybe other useful info like kafka_time?
+
+GitHub Copilot: I'll add a short TODO list for adding ingestion metrics, then show two compact implementations: (A) emit metrics from foreachBatch, (B) poll streaming query progress.
+
+Created 3 todos
+
+Progress: TODOs added. Next: concise code examples you can drop into your job.
+
+A) Add metrics inside `foreachBatch` (recommended)
+- Counts rows per micro-batch and computes min/max `kafka_time`.
+- Optionally appends one-row metrics to a metrics table/path.
+
+Example (insert into your `write_to_iceberg`):
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, LongType, TimestampType, StringType
+
+METRICS_PATH = "/tmp/ingestion/metrics"  # or use an Iceberg table
+
+def write_to_iceberg(batch_df, batch_id):
+    # ensure typed timestamp
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+
+    # batch-level metrics
+    batch_count = batch_df.count()
+    if batch_count > 0:
+        min_ts = batch_df.agg(F.min("kafka_time")).collect()[0][0]
+        max_ts = batch_df.agg(F.max("kafka_time")).collect()[0][0]
+    else:
+        min_ts = None
+        max_ts = None
+
+    # log to stdout (visible in driver/executor logs)
+    print(f"batch_id={batch_id} count={batch_count} min_kafka_time={min_ts} max_kafka_time={max_ts}")
+
+    # persist metrics as a small appendable table (parquet or Iceberg)
+    metrics_row = [(batch_id, batch_count, min_ts, max_ts)]
+    metrics_schema = StructType([
+        StructField("batch_id", LongType()),
+        StructField("num_rows", LongType()),
+        StructField("min_kafka_time", TimestampType()),
+        StructField("max_kafka_time", TimestampType())
+    ])
+    spark.createDataFrame(metrics_row, schema=metrics_schema) \
+         .write.mode("append").parquet(METRICS_PATH)
+
+    # write the actual data to Iceberg
+    batch_df.writeTo("lakehouse.bronze.stg_taxi").append()
+
+B) Poll the streaming query progress (useful for dashboards)
+- After `query = parsed_df.writeStream.foreachBatch(...).start()`, poll `query.lastProgress` or `query.recentProgress`.
+
+Example:
+
+import time
+query = (parsed_df.writeStream
+                .foreachBatch(write_to_iceberg)
+                .option("checkpointLocation", "/tmp/chk-iceberg")
+                .trigger(processingTime="5 seconds")
+                .start())
+
+# simple poll loop (run in driver)
+while query.isActive:
+    progress = query.lastProgress  # None until first trigger
+    if progress:
+        # typical useful fields: numInputRows, inputRowsPerSecond, sources offsets
+        num_rows = progress.get("numInputRows")
+        irps = progress.get("inputRowsPerSecond")
+        print(f"stream progress: numInputRows={num_rows} inputRowsPerSecond={irps}")
+        # inspect sources offsets and timestamp ranges if needed:
+        for src in progress.get("sources", []):
+            print("source:", src.get("description"), "startOffset", src.get("startOffset"), "endOffset", src.get("endOffset"))
+    time.sleep(5)
+
+Notes and quick tips
+- `foreachBatch` gives you exact per-batch control and is the best place to compute, emit, and persist metrics transactionally alongside your writes.
+- Persist metrics to an appendable store (Iceberg table, parquet path, or a monitoring DB) so dashboards can query historical ingestion rates.
+- `query.lastProgress` and `query.recentProgress` expose useful runtime metrics (numInputRows, rates, offsets) for live monitoring.
+- For production monitoring, forward metrics to Prometheus/Grafana or write a small metrics table you query from BI.
+- To view totals across the table, run `spark.read.format("iceberg").load("lakehouse.bronze.stg_taxi").count()` (not recommended continuously).
+
+Want me to:
+- (1) add the `METRICS_PATH` parquet write into your repo (produce.py), or
+- (2) create an Iceberg `lakehouse.monitoring.ingestion_metrics` table and wire metrics writes to it?
+
+Which should I do next?
+
+User: The value column is in json format here: SELECT value FROM lakehouse.bronze.stg_taxi
+    WHERE key = 48 and offset = 822 and partition = 0; how can I view it better?
+
+GitHub Copilot: Short answer — three quick ways to view the JSON nicely.
+
+1) Parse into columns (recommended)
+- PySpark (use a proper StructType):
+```python
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, IntegerType, TimestampType, LongType, DoubleType, StringType
+
+schema = StructType([
+  StructField("VendorID", IntegerType()),
+  StructField("tpep_pickup_datetime", TimestampType()),
+  StructField("tpep_dropoff_datetime", TimestampType()),
+  StructField("passenger_count", LongType()),
+  StructField("trip_distance", DoubleType()),
+  # ... add remaining fields ...
+  StructField("cbd_congestion_fee", DoubleType())
+])
+
+df = (spark.table("lakehouse.bronze.stg_taxi")
+        .filter("key = 48 AND offset = 822 AND partition = 0")
+        .select(F.col("key"), F.col("offset"), F.col("partition"),
+                F.from_json(F.col("value").cast("string"), schema).alias("d"))
+        .select("key","offset","partition","d.*"))
+
+df.show(truncate=False)
+```
+
+2) Quick SQL (no Python schema) — use a SQL struct type:
+```sql
+SELECT key, offset, partition, d.*
+FROM (
+  SELECT key, offset, partition,
+         from_json(value, 'struct<VendorID:int,tpep_pickup_datetime:timestamp,tpep_dropoff_datetime:timestamp,passenger_count:bigint,trip_distance:double,RatecodeID:bigint,store_and_fwd_flag:string,PULocationID:int,DOLocationID:int,payment_type:bigint,fare_amount:double,extra:double,mta_tax:double,tip_amount:double,tolls_amount:double,improvement_surcharge:double,total_amount:double,congestion_surcharge:double,Airport_fee:double,cbd_congestion_fee:double>') AS d
+  FROM lakehouse.bronze.stg_taxi
+  WHERE key = 48 AND offset = 822 AND partition = 0
+) t
+```
+
+3) Pretty-print the raw JSON for a single row (handy for ad-hoc inspection)
+```python
+row = spark.sql("SELECT value FROM lakehouse.bronze.stg_taxi WHERE key=48 AND offset=822 AND partition=0").collect()[0][0]
+import json, sys
+print(json.dumps(json.loads(row), indent=2, ensure_ascii=False))
+```
+
+Extras / tips
+- Use `df.show(truncate=False)` to avoid value truncation.
+- To extract one field without full schema: `get_json_object(value, '$.tpep_pickup_datetime')`.
+- Detect malformed JSON: `parsed = df.withColumn("d", from_json(...)); parsed.filter(col("d").isNull()).show(truncate=False)`.
+- If you want, I can: (A) convert your full DDL string into a ready `StructType` and add it to produce.py, or (B) give a one-liner to create a view with parsed columns. Which do you want?
+
+User: How to check if spark.read.parquet("data/yellow_tripdata_2025-01.parquet") has duplicates
+
+GitHub Copilot: Updating the TODO list to add a task for checking parquet duplicates.
+
+Added 1 todo
+
+Concise methods and code to find duplicates in `spark.read.parquet("data/yellow_tripdata_2025-01.parquet")`.
+
+1) Quick total vs full-row distinct
+```python
+df = spark.read.parquet("data/yellow_tripdata_2025-01.parquet")
+total = df.count()
+distinct = df.distinct().count()     # or df.dropDuplicates().count()
+print("total", total, "distinct_rows", distinct, "duplicates", total-distinct)
+```
+
+2) Duplicates by a set of key columns (recommended)
+- Choose identifying columns that define a "duplicate" (example below).
+```python
+from pyspark.sql import functions as F
+
+key_cols = [
+  "VendorID","tpep_pickup_datetime","tpep_dropoff_datetime",
+  "passenger_count","trip_distance","PULocationID","DOLocationID",
+  "fare_amount","tip_amount","total_amount"
+]
+
+dup_groups = (
+  df.groupBy(*key_cols)
+    .agg(F.count("*").alias("cnt"))
+    .filter(F.col("cnt") > 1)
+    .orderBy(F.desc("cnt"))
+)
+
+dup_groups.show(50, False)   # shows groups with >1 rows
+# total duplicate rows (including the first occurrence)
+dup_rows = dup_groups.select(F.sum("cnt").alias("dup_rows")).collect()[0][0] or 0
+# duplicate rows beyond one unique per group
+extra_dup_rows = dup_groups.select(F.sum(F.col("cnt") - 1).alias("extra")).collect()[0][0] or 0
+print("duplicate groups:", dup_groups.count(), "extra duplicate rows:", extra_dup_rows)
+```
+
+3) List the actual duplicate rows using Window (flags rows with rn>1)
+```python
+from pyspark.sql.window import Window
+from pyspark.sql import functions as F
+
+w = Window.partitionBy(*key_cols).orderBy(F.lit(1))
+dups = df.withColumn("rn", F.row_number().over(w)).filter(F.col("rn") > 1).drop("rn")
+dups.show(100, False)
+```
+
+4) Lightweight checks / large data tips
+- For very large files, avoid full `count()` twice. Use sampling: `df.sample(0.01)...`.
+- Use `approx_count_distinct` for single-column uniqueness checks.
+- Persist duplicate groups or rows to Parquet for inspection:
+```python
+dups.write.mode("overwrite").parquet("/tmp/yellow_dups_sample")
+```
+
+Pick the key columns that define duplicates for your use-case; I can produce a ready-to-run script that writes duplicate rows to tmp or an Iceberg table — which would you prefer?
+
+User: Seems like this sync could be causing duplicates spark.sql("""
+    CREATE TABLE IF NOT EXISTS lakehouse.bronze.stg_taxi (
+        kafka_time TIMESTAMP,
+        key STRING,
+        offset INT,
+        partition INT,
+        value STRING
+    ) USING iceberg
+""")
+
+parsed_df = raw_stream.select(
+    F.col("key").cast("string").alias("key"),
+    F.col("value").cast("string").alias("value"),
+    F.col("partition").cast("int"),
+    F.col("offset").cast("long"),
+    F.col("timestamp").alias("kafka_time")
+).select("key", "value", "partition", "offset", "kafka_time")
+
+def write_to_iceberg(batch_df, batch_id):
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    # batch-level metrics
+    batch_count = batch_df.count()
+    if batch_count > 0:
+        min_ts = batch_df.agg(F.min("kafka_time")).collect()[0][0]
+        max_ts = batch_df.agg(F.max("kafka_time")).collect()[0][0]
+    else:
+        min_ts = None
+        max_ts = None
+    
+    # log to stdout (visible in driver/executor logs)
+    print(f"batch_id={batch_id} count={batch_count} min_kafka_time={min_ts} max_kafka_time={max_ts}")
+    
+    # write the actual data to Iceberg
+    batch_df.writeTo("lakehouse.bronze.stg_taxi").append()
+
+query = (
+    parsed_df.writeStream
+      .foreachBatch(write_to_iceberg)
+      .option("checkpointLocation", "/tmp/chk-iceberg")
+      .trigger(processingTime="5 seconds")
+      .start()
+)
+
+GitHub Copilot: Updating the todo list to add a task for preventing duplicate writes and tracking progress.
+
+Added 1 todo
+
+Yes—those replays/retries can cause duplicates. Concise mitigation options and code you can drop into `write_to_iceberg`.
+
+Why duplicates happen (short)
+- If a micro-batch is retried (job crash, driver fail), `foreachBatch` may re-run the same batch; `writeTo(...).append()` will re-insert unless the sink is idempotent.
+- Checkpointing prevents reprocessing of Kafka offsets only if the checkpoint is durable and used; transient checkpoints or manual re-runs can replay.
+
+Recommended fixes (choose one)
+1) Idempotent dedupe in foreachBatch (simple, reliable)
+   - In each batch, filter out rows already present by matching on a unique key (e.g., `partition`+`offset` or a message id).
+   - Good for small-to-medium workloads.
+
+2) MERGE/Upsert into Iceberg (robust)
+   - Create a temp view for the batch and run `MERGE INTO` on unique key (partition+offset). Atomic and best if Iceberg version supports merge.
+
+3) Track high-water offsets per partition (efficient)
+   - Persist max offset per partition after each successful batch and only write rows with offset > stored_max. Requires transactional update of the offsets store.
+
+Code: left-anti dedupe by partition+offset (easy drop-in)
+
+def write_to_iceberg(batch_df, batch_id):
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    # collect partitions in this batch (small list)
+    parts = [r[0] for r in batch_df.select("partition").distinct().collect()]
+    if parts:
+        existing = (
+            spark.table("lakehouse.bronze.stg_taxi")
+            .select("partition", "offset")
+            .where(F.col("partition").isin(parts))
+        )
+        to_write = batch_df.join(existing, on=["partition", "offset"], how="left_anti")
+    else:
+        to_write = batch_df
+
+    cnt = to_write.count()
+    print(f"batch_id={batch_id} to_write={cnt}")
+    if cnt:
+        to_write.writeTo("lakehouse.bronze.stg_taxi").append()
+
+MERGE INTO example (if Iceberg supports MERGE)
+
+def write_to_iceberg(batch_df, batch_id):
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    batch_df.createOrReplaceTempView("tmp_batch")
+    spark.sql("""
+    MERGE INTO lakehouse.bronze.stg_taxi t
+    USING tmp_batch s
+    ON t.partition = s.partition AND t.offset = s.offset
+    WHEN NOT MATCHED THEN
+      INSERT *
+    """)
+    # no duplicate insert because of merge condition
+
+Notes and cautions
+- The left-anti approach reads only the partitions seen in the batch (keeps cost lower). It still issues a read of the target table.
+- For very high throughput, use high-water offsets or Iceberg MERGE for better perf.
+- Always ensure your `checkpointLocation` is stable and not removed between runs.
+- For debugging, persist `batch_id`, `num_rows`, `min_kafka_time`, `max_kafka_time` to a metrics table so you can correlate replays with duplicate counts.
+
+If you want, I can:
+- Implement the left-anti dedupe in your produce.py, or
+- Add the `MERGE INTO` variant and a small helper to create a metrics Iceberg table.
+
+Which do you want me to add?
+
+User: How to clear the checkpoints?
+
+GitHub Copilot: I'll show safe steps to stop, backup, and remove a checkpoint, plus warnings and alternatives.
+
+Steps (concise)
+- Stop the streaming query first (avoid partial writes):
+```python
+# in your driver / notebook
+for q in spark.streams.active:
+    print(q.id, q.name)
+    q.stop()
+```
+or call `query.stop()` on the Query handle you created.
+
+- Backup the checkpoint directory (recommended):
+```bash
+cp -r /tmp/chk-iceberg /tmp/chk-iceberg.bak
+```
+(HDFS: `hdfs dfs -cp`, S3: `aws s3 cp --recursive` or `aws s3 mv`)
+
+- Remove the checkpoint (this makes Spark ignore previous offsets):
+```bash
+rm -rf /tmp/chk-iceberg
+```
+(or `rm -rf /tmp/chk-iceberg/*` to keep the directory)
+
+- Restart your streaming job with the desired `startingOffsets` (e.g., `"earliest"`). Note: Spark will use `startingOffsets` only when no checkpoint exists.
+
+Important warnings and alternatives
+- Deleting the checkpoint will usually cause Kafka data to be reprocessed and can create duplicate writes into your sink. Only do this when you intend to re-ingest.
+- If you want to avoid duplicates instead of deleting checkpoints, use one of the dedupe strategies I suggested earlier (left-anti by partition+offset or MERGE into Iceberg).
+- If duplicates already exist in the target, you must dedupe or rollback snapshots in Iceberg (MERGE/DELETE or restore an earlier snapshot) — deleting checkpoints does not remove already-written data.
+- For S3/HDFS checkpoints, use the appropriate CLI (`aws s3 rm --recursive`, `hdfs dfs -rm -r`) and always back up first.
+
+If you want, I can:
+- Add a small script to safely rotate the checkpoint (backup + remove + restart), or
+- Implement the dedupe-before-write logic in your `write_to_iceberg` so you can safely restart without deleting checkpoints. Which do you prefer?
+
+User: {"ts": "2026-03-28 09:51:13.251", "level": "ERROR", "logger": "SQLQueryContextLogger", "msg": "[TABLE_OR_VIEW_NOT_FOUND] The table or view `tmp_batch` cannot be found. Verify the spelling and correctness of the schema and catalog.\nIf you did not qualify the name with a schema, verify the current_schema() output, or qualify the name with the correct schema and catalog.\nTo tolerate the error on drop use DROP VIEW IF EXISTS or DROP TABLE IF EXISTS. SQLSTATE: 42P01", "context": {"errorClass": "TABLE_OR_VIEW_NOT_FOUND"}, "exception": {"class": "Py4JJavaError", "msg": "An error occurred while calling o55.sql.\n: org.apache.spark.sql.AnalysisException: [TABLE_OR_VIEW_NOT_FOUND] The table or view `tmp_batch` cannot be found. Verify the spelling and correctness of the schema and catalog.\nIf you did not qualify the name with a schema, verify the current_schema() output, or qualify the name with the correct schema and catalog.\nTo tolerate the error on drop use DROP VIEW IF EXISTS or DROP TABLE IF EXISTS. SQLSTATE: 42P01; line 3 pos 14;\n'MergeIntoTable (('t.partition = 's.partition) AND ('t.offset = 's.offset)), [insertstaraction(None)], false\n:- SubqueryAlias t\n:  +- SubqueryAlias lakehouse.bronze.stg_taxi\n:     +- RelationV2[kafka_time#61, key#62, offset#63, partition#64, value#65] lakehouse.bronze.stg_taxi\n+- 'SubqueryAlias s\n   +- 'UnresolvedRelation [tmp_batch], [], false\n\n\tat org.apache.spark.sql.catalyst.analysis.package$AnalysisErrorAt.tableNotFound(package.scala:91)\n\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.$anonfun$checkAnalysis0$2(CheckAnalysis.scala:303)\n\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.$anonfun$checkAnalysis0$2$adapted(CheckAnalysis.scala:281)\n\tat org.apache.spark.sql.catalyst.trees.TreeNode.foreachUp(TreeNode.scala:273)\n\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1(TreeNode.scala:272)\n\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1$adapted(TreeNode.scala:272)\n\tat scala.collection.immutable.Vector.foreach(Vector.scala:2125)\n\tat org.apache.spark.sql.catalyst.trees.TreeNode.foreachUp(TreeNode.scala:272)\n\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1(TreeNode.scala:272)\n\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1$adapted(TreeNode.scala:272)\n\tat scala.collection.immutable.Vector.foreach(Vector.scala:2125)\n\tat org.apache.spark.sql.catalyst.trees.TreeNode.foreachUp(TreeNode.scala:272)\n\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis0(CheckAnalysis.scala:281)\n\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis0$(CheckAnalysis.scala:252)\n\tat org.apache.spark.sql.catalyst.analysis.Analyzer.checkAnalysis0(Analyzer.scala:289)\n\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis(CheckAnalysis.scala:241)\n\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis$(CheckAnalysis.scala:228)\n\tat org.apache.spark.sql.catalyst.analysis.Analyzer.checkAnalysis(Analyzer.scala:289)\n\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.$anonfun$resolveInFixedPoint$1(HybridAnalyzer.scala:238)\n\tat scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.scala:18)\n\tat org.apache.spark.sql.catalyst.QueryPlanningTracker$.withTracker(QueryPlanningTracker.scala:89)\n\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.resolveInFixedPoint(HybridAnalyzer.scala:238)\n\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.$anonfun$apply$1(HybridAnalyzer.scala:91)\n\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.withTrackedAnalyzerBridgeState(HybridAnalyzer.scala:122)\n\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.apply(HybridAnalyzer.scala:84)\n\tat org.apache.spark.sql.catalyst.analysis.Analyzer.$anonfun$executeAndCheck$1(Analyzer.scala:322)\n\tat org.apache.spark.sql.catalyst.plans.logical.AnalysisHelper$.markInAnalyzer(AnalysisHelper.scala:423)\n\tat org.apache.spark.sql.catalyst.analysis.Analyzer.executeAndCheck(Analyzer.scala:322)\n\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$lazyAnalyzed$2(QueryExecution.scala:139)\n\tat org.apache.spark.sql.catalyst.QueryPlanningTracker.measurePhase(QueryPlanningTracker.scala:148)\n\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$executePhase$2(QueryExecution.scala:330)\n\tat org.apache.spark.sql.execution.QueryExecution$.withInternalError(QueryExecution.scala:717)\n\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$executePhase$1(QueryExecution.scala:330)\n\tat org.apache.spark.sql.SparkSession.withActive(SparkSession.scala:804)\n\tat org.apache.spark.sql.execution.QueryExecution.executePhase(QueryExecution.scala:329)\n\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$lazyAnalyzed$1(QueryExecution.scala:139)\n\tat scala.util.Try$.apply(Try.scala:217)\n\tat org.apache.spark.util.Utils$.doTryWithCallerStacktrace(Utils.scala:1392)\n\tat org.apache.spark.util.Utils$.getTryWithCallerStacktrace(Utils.scala:1453)\n\tat org.apache.spark.util.LazyTry.get(LazyTry.scala:58)\n\tat org.apache.spark.sql.execution.QueryExecution.analyzed(QueryExecution.scala:150)\n\tat org.apache.spark.sql.execution.QueryExecution.assertAnalyzed(QueryExecution.scala:90)\n\tat org.apache.spark.sql.classic.Dataset$.$anonfun$ofRows$5(Dataset.scala:138)\n\tat org.apache.spark.sql.SparkSession.withActive(SparkSession.scala:804)\n\tat org.apache.spark.sql.classic.Dataset$.ofRows(Dataset.scala:135)\n\tat org.apache.spark.sql.classic.SparkSession.$anonfun$sql$1(SparkSession.scala:532)\n\tat org.apache.spark.sql.SparkSession.withActive(SparkSession.scala:804)\n\tat org.apache.spark.sql.classic.SparkSession.sql(SparkSession.scala:502)\n\tat org.apache.spark.sql.classic.SparkSession.sql(SparkSession.scala:537)\n\tat java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)\n\tat java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)\n\tat java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)\n\tat java.base/java.lang.reflect.Method.invoke(Method.java:569)\n\tat py4j.reflection.MethodInvoker.invoke(MethodInvoker.java:244)\n\tat py4j.reflection.ReflectionEngine.invoke(ReflectionEngine.java:374)\n\tat py4j.Gateway.invoke(Gateway.java:282)\n\tat py4j.commands.AbstractCommand.invokeMethod(AbstractCommand.java:132)\n\tat py4j.commands.CallCommand.execute(CallCommand.java:79)\n\tat py4j.ClientServerConnection.sendCommand(ClientServerConnection.java:246)\n\tat py4j.CallbackClient.sendCommand(CallbackClient.java:384)\n\tat py4j.CallbackClient.sendCommand(CallbackClient.java:356)\n\tat py4j.reflection.PythonProxyHandler.invoke(PythonProxyHandler.java:106)\n\tat jdk.proxy3/jdk.proxy3.$Proxy61.call(Unknown Source)\n\tat org.apache.spark.sql.execution.streaming.sources.PythonForeachBatchHelper$.$anonfun$callForeachBatch$1(ForeachBatchSink.scala:87)\n\tat org.apache.spark.sql.execution.streaming.sources.PythonForeachBatchHelper$.$anonfun$callForeachBatch$1$adapted(ForeachBatchSink.scala:87)\n\tat org.apache.spark.sql.execution.streaming.sources.ForeachBatchSink.callBatchWriter(ForeachBatchSink.scala:56)\n\tat org.apache.spark.sql.execution.streaming.sources.ForeachBatchSink.addBatch(ForeachBatchSink.scala:49)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.$anonfun$runBatch$19(MicroBatchExecution.scala:1074)\n\tat org.apache.spark.sql.execution.SQLExecution$.$anonfun$withNewExecutionId0$8(SQLExecution.scala:176)\n\tat org.apache.spark.sql.execution.SQLExecution$.withSessionTagsApplied(SQLExecution.scala:284)\n\tat org.apache.spark.sql.execution.SQLExecution$.$anonfun$withNewExecutionId0$7(SQLExecution.scala:138)\n\tat org.apache.spark.JobArtifactSet$.withActiveJobArtifactState(JobArtifactSet.scala:94)\n\tat org.apache.spark.sql.artifact.ArtifactManager.$anonfun$withResources$1(ArtifactManager.scala:112)\n\tat org.apache.spark.sql.artifact.ArtifactManager.withClassLoaderIfNeeded(ArtifactManager.scala:106)\n\tat org.apache.spark.sql.artifact.ArtifactManager.withResources(ArtifactManager.scala:111)\n\tat org.apache.spark.sql.execution.SQLExecution$.$anonfun$withNewExecutionId0$6(SQLExecution.scala:138)\n\tat org.apache.spark.sql.execution.SQLExecution$.withSQLConfPropagated(SQLExecution.scala:307)\n\tat org.apache.spark.sql.execution.SQLExecution$.$anonfun$withNewExecutionId0$1(SQLExecution.scala:137)\n\tat org.apache.spark.sql.SparkSession.withActive(SparkSession.scala:804)\n\tat org.apache.spark.sql.execution.SQLExecution$.withNewExecutionId0(SQLExecution.scala:91)\n\tat org.apache.spark.sql.execution.SQLExecution$.withNewExecutionId(SQLExecution.scala:249)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.$anonfun$runBatch$18(MicroBatchExecution.scala:1065)\n\tat org.apache.spark.sql.execution.streaming.runtime.ProgressContext.reportTimeTaken(ProgressReporter.scala:200)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.runBatch(MicroBatchExecution.scala:1065)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.$anonfun$executeOneBatch$2(MicroBatchExecution.scala:516)\n\tat scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.scala:18)\n\tat org.apache.spark.sql.execution.streaming.runtime.ProgressContext.reportTimeTaken(ProgressReporter.scala:200)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.executeOneBatch(MicroBatchExecution.scala:481)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.$anonfun$runActivatedStream$1(MicroBatchExecution.scala:461)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.$anonfun$runActivatedStream$1$adapted(MicroBatchExecution.scala:461)\n\tat org.apache.spark.sql.execution.streaming.runtime.TriggerExecutor.runOneBatch(TriggerExecutor.scala:40)\n\tat org.apache.spark.sql.execution.streaming.runtime.TriggerExecutor.runOneBatch$(TriggerExecutor.scala:38)\n\tat org.apache.spark.sql.execution.streaming.runtime.ProcessingTimeExecutor.runOneBatch(TriggerExecutor.scala:71)\n\tat org.apache.spark.sql.execution.streaming.runtime.ProcessingTimeExecutor.execute(TriggerExecutor.scala:83)\n\tat org.apache.spark.sql.execution.streaming.runtime.MicroBatchExecution.runActivatedStream(MicroBatchExecution.scala:461)\n\tat org.apache.spark.sql.execution.streaming.runtime.StreamExecution.$anonfun$runStream$1(StreamExecution.scala:347)\n\tat scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.scala:18)\n\tat org.apache.spark.sql.SparkSession.withActive(SparkSession.scala:804)\n\tat org.apache.spark.sql.execution.streaming.runtime.StreamExecution.org$apache$spark$sql$execution$streaming$runtime$StreamExecution$$runStream(StreamExecution.scala:307)\n\tat org.apache.spark.sql.execution.streaming.runtime.StreamExecution$$anon$1.run(StreamExecution.scala:230)\n\tSuppressed: org.apache.spark.util.Utils$OriginalTryStackTraceException: Full stacktrace of original doTryWithCallerStacktrace caller\n\t\tat org.apache.spark.sql.catalyst.analysis.package$AnalysisErrorAt.tableNotFound(package.scala:91)\n\t\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.$anonfun$checkAnalysis0$2(CheckAnalysis.scala:303)\n\t\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.$anonfun$checkAnalysis0$2$adapted(CheckAnalysis.scala:281)\n\t\tat org.apache.spark.sql.catalyst.trees.TreeNode.foreachUp(TreeNode.scala:273)\n\t\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1(TreeNode.scala:272)\n\t\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1$adapted(TreeNode.scala:272)\n\t\tat scala.collection.immutable.Vector.foreach(Vector.scala:2125)\n\t\tat org.apache.spark.sql.catalyst.trees.TreeNode.foreachUp(TreeNode.scala:272)\n\t\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1(TreeNode.scala:272)\n\t\tat org.apache.spark.sql.catalyst.trees.TreeNode.$anonfun$foreachUp$1$adapted(TreeNode.scala:272)\n\t\tat scala.collection.immutable.Vector.foreach(Vector.scala:2125)\n\t\tat org.apache.spark.sql.catalyst.trees.TreeNode.foreachUp(TreeNode.scala:272)\n\t\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis0(CheckAnalysis.scala:281)\n\t\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis0$(CheckAnalysis.scala:252)\n\t\tat org.apache.spark.sql.catalyst.analysis.Analyzer.checkAnalysis0(Analyzer.scala:289)\n\t\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis(CheckAnalysis.scala:241)\n\t\tat org.apache.spark.sql.catalyst.analysis.CheckAnalysis.checkAnalysis$(CheckAnalysis.scala:228)\n\t\tat org.apache.spark.sql.catalyst.analysis.Analyzer.checkAnalysis(Analyzer.scala:289)\n\t\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.$anonfun$resolveInFixedPoint$1(HybridAnalyzer.scala:238)\n\t\tat scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.scala:18)\n\t\tat org.apache.spark.sql.catalyst.QueryPlanningTracker$.withTracker(QueryPlanningTracker.scala:89)\n\t\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.resolveInFixedPoint(HybridAnalyzer.scala:238)\n\t\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.$anonfun$apply$1(HybridAnalyzer.scala:91)\n\t\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.withTrackedAnalyzerBridgeState(HybridAnalyzer.scala:122)\n\t\tat org.apache.spark.sql.catalyst.analysis.resolver.HybridAnalyzer.apply(HybridAnalyzer.scala:84)\n\t\tat org.apache.spark.sql.catalyst.analysis.Analyzer.$anonfun$executeAndCheck$1(Analyzer.scala:322)\n\t\tat org.apache.spark.sql.catalyst.plans.logical.AnalysisHelper$.markInAnalyzer(AnalysisHelper.scala:423)\n\t\tat org.apache.spark.sql.catalyst.analysis.Analyzer.executeAndCheck(Analyzer.scala:322)\n\t\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$lazyAnalyzed$2(QueryExecution.scala:139)\n\t\tat org.apache.spark.sql.catalyst.QueryPlanningTracker.measurePhase(QueryPlanningTracker.scala:148)\n\t\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$executePhase$2(QueryExecution.scala:330)\n\t\tat org.apache.spark.sql.execution.QueryExecution$.withInternalError(QueryExecution.scala:717)\n\t\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$executePhase$1(QueryExecution.scala:330)\n\t\tat org.apache.spark.sql.SparkSession.withActive(SparkSession.scala:804)\n\t\tat org.apache.spark.sql.execution.QueryExecution.executePhase(QueryExecution.scala:329)\n\t\tat org.apache.spark.sql.execution.QueryExecution.$anonfun$lazyAnalyzed$1(QueryExecution.scala:139)\n\t\tat scala.util.Try$.apply(Try.scala:217)\n\t\tat org.apache.spark.util.Utils$.doTryWithCallerStacktrace(Utils.scala:1392)\n\t\tat org.apache.spark.util.LazyTry.tryT$lzycompute(LazyTry.scala:46)\n\t\tat org.apache.spark.util.LazyTry.tryT(LazyTry.scala:46)\n\t\t... 61 more\n", "stacktrace": [{"class": null, "method": "deco", "file": "/usr/local/spark/python/pyspark/errors/exceptions/captured.py", "line": "263"}, {"class": null, "method": "get_return_value", "file": "/usr/local/spark/python/lib/py4j-0.10.9.9-src.zip/py4j/protocol.py", "line": "327"}]}}
+
+GitHub Copilot: Cause — short
+- Spark couldn't find `tmp_batch` because it wasn't registered in the SQL namespace you queried. A temp view must be created in the same Spark session and visible to `spark.sql` before you run the MERGE.
+
+Fix (pick one)
+
+1) Create a session temp view and MERGE (most common)
+```python
+def write_to_iceberg(batch_df, batch_id):
+    batch_df = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    batch_df.createOrReplaceTempView("tmp_batch")        # register view
+    spark.sql("""
+      MERGE INTO lakehouse.bronze.stg_taxi t
+      USING tmp_batch s
+      ON t.partition = s.partition AND t.offset = s.offset
+      WHEN NOT MATCHED THEN INSERT *
+    """)
+```
+
+2) Use a global temp view if session scoping is an issue (refer as `global_temp.<name>`)
+```python
+batch_df.createOrReplaceGlobalTempView("tmp_batch")
+spark.sql("""
+  MERGE INTO lakehouse.bronze.stg_taxi t
+  USING global_temp.tmp_batch s
+  ON t.partition = s.partition AND t.offset = s.offset
+  WHEN NOT MATCHED THEN INSERT *
+""")
+```
+
+Notes and gotchas (brief)
+- Make sure the `MERGE` syntax (`INSERT *`) is supported by your Spark + Iceberg versions; if not, list columns explicitly in the `INSERT`.
+- Register the view before calling `spark.sql` and ensure the `spark` variable refers to the same SparkSession.
+- If you still see "table/view not found", print `spark.catalog.listTables()` inside `foreachBatch` to confirm the view exists and its name/schema.
+- As an alternative (no SQL views), do left-anti dedupe in pure DataFrame API before writing (safer and sometimes simpler for streaming jobs).
+
+If you want, I can add the MERGE code into your `write_to_iceberg` function (with explicit column list) and a small check that prints `spark.catalog.listTables()` for debugging. Which would you prefer?
+
+User: Still the same error
+
+GitHub Copilot: I'm updating the TODOs to track debugging the `tmp_batch` MERGE error, then I'll show a concise debug-ready `write_to_iceberg` implementation and fallbacks.
+
+Added 1 todo
+
+Debug checklist (quick)
+- Ensure `createOrReplaceTempView("tmp_batch")` runs in the same `SparkSession` as `spark.sql(...)`.
+- Confirm the temp view exists inside the batch function via `spark.catalog.listTables()`.
+- If temp view still unresolved, use `createOrReplaceGlobalTempView` and reference `global_temp.tmp_batch`.
+- If MERGE fails, fall back to DataFrame left-anti dedupe.
+
+Drop-in `write_to_iceberg` to debug and safely MERGE (uses explicit column list):
+
+def write_to_iceberg(batch_df, batch_id):
+    batch = batch_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+    cols = batch.columns  # list of columns present in batch
+    # register temp view
+    batch.createOrReplaceTempView("tmp_batch")
+    # debug: list tables to confirm the temp view exists
+    print("catalog tables (sample):", [t.name + (" (tmp)" if t.isTemporary else "") for t in spark.catalog.listTables()][:50])
+    # build safe MERGE with explicit columns
+    cols_sql = ", ".join([f"`{c}`" for c in cols])
+    values_sql = ", ".join([f"s.`{c}`" for c in cols])
+    merge_sql = f"""
+    MERGE INTO lakehouse.bronze.stg_taxi t
+    USING tmp_batch s
+    ON t.partition = s.partition AND t.offset = s.offset
+    WHEN NOT MATCHED THEN INSERT ({cols_sql}) VALUES ({values_sql})
+    """
+    try:
+        spark.sql(merge_sql)
+        print(f"batch_id={batch_id} MERGE succeeded, rows={batch.count()}")
+    except Exception as e:
+        print("MERGE failed:", e)
+        # fallback: left-anti dedupe and append
+        target = spark.table("lakehouse.bronze.stg_taxi").select("partition","offset")
+        to_write = batch.join(target, on=["partition","offset"], how="left_anti")
+        cnt = to_write.count()
+        if cnt:
+            to_write.writeTo("lakehouse.bronze.stg_taxi").append()
+        print(f"batch_id={batch_id} fallback append wrote {cnt} rows")
+
+If `tmp_batch` still cannot be found:
+- Replace `createOrReplaceTempView("tmp_batch")` with:
+  batch.createOrReplaceGlobalTempView("tmp_batch")
+  then change MERGE `USING global_temp.tmp_batch s` (or call `spark.catalog.listTables('global_temp')` to inspect).
+- Ensure `spark` inside `write_to_iceberg` is the same SparkSession (no accidental new sessions).
+- Print `spark.sparkContext.applicationId` and `spark.conf.get("spark.sql.catalog")` if needed.
+
+Immediate safe alternative
+- Use the fallback left-anti approach permanently (avoids SQL view issues).
+
+If you want, I can:
+- Patch your job with the debug `write_to_iceberg` above in produce.py, or
+- Replace MERGE with the left-anti strategy directly.
+
+Which should I apply?
+
+User: 
+
+Make sure that the fields here are cast into correct types. fill nulls for more obvious fields:
+
+silver_df = (
+    spark.table("lakehouse.bronze.stg_taxi")
+    .select(F.from_json("raw_value", taxi_schema).alias("d"))
+    .select(
+        "d.VendorID",
+        "d.RatecodeID",
+        "d.PULocationID",
+        "d.DOLocationID",
+        F.to_timestamp("d.tpep_pickup_datetime").alias("tpep_pickup_datetime"),
+        F.to_timestamp("d.tpep_dropoff_datetime").alias("tpep_dropoff_datetime"),
+        "d.passenger_count",
+        "d.trip_distance",
+        "d.store_and_fwd_flag",
+        "d.payment_type",
+        "d.fare_amount",
+        "d.extra",
+        "d.mta_tax",
+        "d.tip_amount",
+        "d.tolls_amount",
+        "d.improvement_surcharge",
+        "d.total_amount",
+        "d.congestion_surcharge",
+        "d.Airport_fee",
+        "d.cbd_congestion_fee",
+    )
+    .filter(F.col("temperature").isNotNull())
+    .filter(F.col("sensor_id").isNotNull())
+)
+
+taxi_schema = """
+    VendorID INT,
+    tpep_pickup_datetime TIMESTAMP,
+    tpep_dropoff_datetime TIMESTAMP,
+    passenger_count BIGINT,
+    trip_distance DOUBLE,
+    RatecodeID BIGINT,
+    store_and_fwd_flag STRING,
+    PULocationID INT,
+    DOLocationID INT,
+    payment_type BIGINT,
+    fare_amount DOUBLE,
+    extra DOUBLE,
+    mta_tax DOUBLE,
+    tip_amount DOUBLE,
+    tolls_amount DOUBLE,
+    improvement_surcharge DOUBLE,
+    total_amount DOUBLE,
+    congestion_surcharge DOUBLE,
+    Airport_fee DOUBLE,
+    cbd_congestion_fee DOUBLE
+"""
+
+
+GitHub Copilot: Added 1 todo
+
+Nice catch — your snippet had a few issues (using `raw_value`, missing typed schema, leftover filters). Below is a corrected, concise pipeline: builds a proper StructType, parses from the `value` column, filters malformed rows, casts columns explicitly, fills obvious nulls, and filters on pickup timestamp and pickup location.
+
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, LongType, DoubleType, StringType, TimestampType
+)
+
+taxi_schema = StructType([
+    StructField("VendorID", IntegerType(), True),
+    StructField("tpep_pickup_datetime", TimestampType(), True),
+    StructField("tpep_dropoff_datetime", TimestampType(), True),
+    StructField("passenger_count", LongType(), True),
+    StructField("trip_distance", DoubleType(), True),
+    StructField("RatecodeID", LongType(), True),
+    StructField("store_and_fwd_flag", StringType(), True),
+    StructField("PULocationID", IntegerType(), True),
+    StructField("DOLocationID", IntegerType(), True),
+    StructField("payment_type", LongType(), True),
+    StructField("fare_amount", DoubleType(), True),
+    StructField("extra", DoubleType(), True),
+    StructField("mta_tax", DoubleType(), True),
+    StructField("tip_amount", DoubleType(), True),
+    StructField("tolls_amount", DoubleType(), True),
+    StructField("improvement_surcharge", DoubleType(), True),
+    StructField("total_amount", DoubleType(), True),
+    StructField("congestion_surcharge", DoubleType(), True),
+    StructField("Airport_fee", DoubleType(), True),
+    StructField("cbd_congestion_fee", DoubleType(), True),
+])
+
+# parse, filter malformed JSON, and project typed columns
+df0 = spark.table("lakehouse.bronze.stg_taxi").select(F.col("value").cast("string").alias("raw_value"))
+df1 = df0.select(F.from_json("raw_value", taxi_schema).alias("d"), "raw_value").filter(F.col("d").isNotNull())
+
+silver_df = df1.select(
+    F.col("d.VendorID").cast(IntegerType()).alias("VendorID"),
+    F.col("d.RatecodeID").cast(LongType()).alias("RatecodeID"),
+    F.col("d.PULocationID").cast(IntegerType()).alias("PULocationID"),
+    F.col("d.DOLocationID").cast(IntegerType()).alias("DOLocationID"),
+    F.to_timestamp(F.col("d.tpep_pickup_datetime")).alias("tpep_pickup_datetime"),
+    F.to_timestamp(F.col("d.tpep_dropoff_datetime")).alias("tpep_dropoff_datetime"),
+    F.col("d.passenger_count").cast(LongType()).alias("passenger_count"),
+    F.col("d.trip_distance").cast(DoubleType()).alias("trip_distance"),
+    F.col("d.store_and_fwd_flag").cast(StringType()).alias("store_and_fwd_flag"),
+    F.col("d.payment_type").cast(LongType()).alias("payment_type"),
+    F.col("d.fare_amount").cast(DoubleType()).alias("fare_amount"),
+    F.col("d.extra").cast(DoubleType()).alias("extra"),
+    F.col("d.mta_tax").cast(DoubleType()).alias("mta_tax"),
+    F.col("d.tip_amount").cast(DoubleType()).alias("tip_amount"),
+    F.col("d.tolls_amount").cast(DoubleType()).alias("tolls_amount"),
+    F.col("d.improvement_surcharge").cast(DoubleType()).alias("improvement_surcharge"),
+    F.col("d.total_amount").cast(DoubleType()).alias("total_amount"),
+    F.col("d.congestion_surcharge").cast(DoubleType()).alias("congestion_surcharge"),
+    F.col("d.Airport_fee").cast(DoubleType()).alias("Airport_fee"),
+    F.col("d.cbd_congestion_fee").cast(DoubleType()).alias("cbd_congestion_fee"),
+)
+
+# fill obvious nulls with sensible defaults
+silver_df = silver_df.fillna({
+    "passenger_count": 0,
+    "trip_distance": 0.0,
+    "fare_amount": 0.0,
+    "tip_amount": 0.0,
+    "total_amount": 0.0,
+    "store_and_fwd_flag": "N",
+    "payment_type": -1,
+    "VendorID": -1,
+    "PULocationID": -1,
+    "DOLocationID": -1
+})
+
+# keep only rows with pickup timestamp and pickup location present
+silver_df = silver_df.filter(F.col("tpep_pickup_datetime").isNotNull()).filter(F.col("PULocationID").isNotNull())
+
+# preview
+silver_df.show(5, truncate=False)
+
+If you want different null defaults (e.g., keep nulls for IDs), tell me which fields to change and I’ll adjust.
+
+User: parsed_df = (
+    raw_stream
+    .select(
+        F.col("key").cast("string").alias("key"),
+        F.col("value"),
+        "partition",
+        "offset",
+        F.col("timestamp").alias("kafka_time"),
+    )
+    .select("key", "value", "partition", "offset", "kafka_time")
+)
+
+parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .queryName("bronze_taxi")
+    .outputMode("complete")            # full table re-emitted every trigger
+    .option("checkpointLocation", "/tmp/chk-taxi-complete")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+
+spark.sql("""
+    SELECT key, value, partition, offset, kafka_time
+    FROM bronze_taxi
+    ORDER BY offset
+""").show(truncate=False) 
+IllegalArgumentException: 'path' is not specified.
+
+GitHub Copilot: I'll add a short TODO list tracking the fix, then show two minimal fixes you can apply (memory sink for interactive SQL, or JSON file sink with path).
+
+Created 2 todos
+
+Progress: TODOs recorded and fixes prepared.
+
+Cause: format("json") is the file sink and requires a `path` option; you cannot query it via `spark.sql` as an in-memory table. Options:
+
+1) Quick interactive fix — write to the memory sink so `spark.sql("SELECT ... FROM bronze_taxi")` works:
+
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("memory")
+    .queryName("bronze_taxi")
+    .outputMode("complete")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+```
+
+2) Persist JSON files (durable) — provide a path and then read the files as a table:
+
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .option("path", "/tmp/bronze_taxi_json")           # required for file sink
+    .option("checkpointLocation", "/tmp/chk-taxi-json")
+    .outputMode("append")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+# Later, to query:
+spark.read.json("/tmp/bronze_taxi_json").createOrReplaceTempView("bronze_taxi")
+spark.sql("SELECT key, value, partition, offset, kafka_time FROM bronze_taxi ORDER BY offset").show(truncate=False)
+```
+
+Recommendation: use the `memory` sink for quick interactive exploration; use the file sink with `.option("path", ...)` (and read it into a table) for durability.
+
+User: 
+AnalysisException: This query does not support recovering from checkpoint location. Delete /tmp/chk-taxi-complete/offsets to start over.
+
+GitHub Copilot: I'll add a short TODO list for the checkpoint fix, then show exact stop/remove/restart commands.
+
+Created 3 todos
+
+Progress: TODOs recorded. Next: stop the stream, delete the offsets, then restart with a safe checkpoint or different sink.
+
+Steps (pick one):
+
+1) Stop running streaming queries from your notebook (run in PySpark / notebook cell):
+```python
+for q in spark.streams.active:
+    print(q.name, q.id, q.isActive)
+    q.stop()
+```
+
+2) Remove the problematic offsets directory (shell or Python). Warning: this discards recoverable state — only do if you want to start over.
+Shell:
+```bash
+ls -la /tmp/chk-taxi-complete
+rm -rf /tmp/chk-taxi-complete/offsets
+```
+Python:
+```python
+import shutil
+shutil.rmtree("/tmp/chk-taxi-complete/offsets", ignore_errors=True)
+```
+
+3) Restart the stream — choose one:
+
+- If you want quick interactive SQL (memory sink — note: memory sink doesn't support recovery; do NOT reuse a checkpoint for it):
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("memory")
+    .queryName("bronze_taxi")
+    .outputMode("complete")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+```
+
+- If you want durable files (file sink) — provide a `path` and a fresh checkpoint:
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .option("path", "/tmp/bronze_taxi_json")
+    .option("checkpointLocation", "/tmp/chk-taxi-json")
+    .outputMode("append")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+```
+Then read into a temp view:
+```python
+spark.read.json("/tmp/bronze_taxi_json").createOrReplaceTempView("bronze_taxi")
+spark.sql("SELECT key, value, partition, offset, kafka_time FROM bronze_taxi ORDER BY offset").show(truncate=False)
+```
+
+Notes:
+- The AnalysisException means the existing checkpoint was for a query type that doesn't support recovery; deleting `/tmp/chk-taxi-complete/offsets` (or using a new checkpoint path) is the fix.
+- Prefer unique checkpoint paths per query or use file sink for durable pipelines. Need help running these steps in your environment? I can run the shell commands if you want.
+
+User: Got it to work. What is the .trigger here: parsed_query = (
+    parsed_df.writeStream
+    .format("json")
+    .outputMode("append")
+    .option("path",               "/tmp/bronze")
+    .option("checkpointLocation", "/tmp/chk-bronze")
+    .trigger(processingTime="5 seconds")
+    .start()
+)
+
+
+GitHub Copilot: I'll explain what `.trigger(...)` does and give short examples and alternatives.
+
+- What it does: `.trigger(processingTime="5 seconds")` tells Spark Structured Streaming to run the query in periodic micro-batches, scheduling a new batch every 5 seconds (equivalent to `Trigger.ProcessingTime("5 seconds")`). The first batch runs as soon as work is available; subsequent batches run at the given interval.
+
+- Programmatic form:
+```python
+from pyspark.sql.streaming import Trigger
+
+parsed_query = (
+    parsed_df.writeStream
+    ...
+    .trigger(Trigger.ProcessingTime("5 seconds"))
+    .start()
+)
+```
+
+- Other useful triggers:
+  - `Trigger.ProcessingTime("N seconds")` — periodic micro-batches (default pattern).
+  - `Trigger.Once()` — run a single micro-batch that processes all available data then stop.
+  - `Trigger.AvailableNow()` — process all currently available data and stop (useful for ingestion catch-up jobs).
+
+- Practical notes:
+  - Shorter intervals → lower latency but higher scheduling/overhead; longer intervals → better throughput.
+  - Checkpointing (`checkpointLocation`) is still required for durable recovery with most sinks.
+  - Use `Trigger.Once()` or `AvailableNow()` for one-off batch-style runs; use `ProcessingTime` for continuous micro-batch streaming.
+
+User: spark.sql("""
+    CREATE OR REPLACE TABLE stg_taxi (
+        value    STRING,
+        kafka_time  TIMESTAMP
+    ) USING iceberg
+""") IllegalArgumentException: Cannot open table: path is not set
+
+GitHub Copilot: I'll update the TODO list to record the Iceberg table fix.
+
+Completed: *Stop active streaming queries* (1/4)
+
+Progress: TODOs updated.
+
+Cause and fixes (concise):
+
+- Cause: creating an Iceberg table without a catalog or LOCATION uses the default Spark catalog which doesn't know where to store Iceberg files — hence "path is not set".
+
+- Fix A — create the table in the configured Iceberg catalog (`lakehouse`) so Iceberg uses the warehouse (MinIO) you configured in README.md:
+```python
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.taxi.stg_taxi (
+  value STRING,
+  kafka_time TIMESTAMP
+) USING iceberg
+""")
+```
+
+- Fix B — explicitly set a location (less recommended here since `lakehouse` already points to the correct S3/MinIO warehouse):
+```python
+spark.sql("""
+CREATE TABLE IF NOT EXISTS stg_taxi (
+  value STRING,
+  kafka_time TIMESTAMP
+) USING iceberg
+LOCATION 's3://warehouse/path/to/stg_taxi'
+""")
+```
+
+- Quick alternative (non-Iceberg staging for fast prototyping): use a temp view instead of an Iceberg table:
+```python
+parsed_df.createOrReplaceTempView("stg_taxi_temp")
+spark.sql("SELECT * FROM stg_taxi_temp").show()
+```
+
+Recommendation: use Fix A (`lakehouse.taxi.stg_taxi`) so Spark/Iceberg writes to MinIO via the `lakehouse` catalog configured in your README.md.
+
+User: Maybe anything wrong with the config S3_ENDPOINT = "http://minio:9000"
+S3_BUCKET   = "s3a://warehouse"
+
+spark = (
+    SparkSession.builder
+    .appName("bdm_week04_lakehouse")
+    .master("local[*]")
+    .config("spark.sql.shuffle.partitions", "4")
+    # ---- S3 / MinIO configuration ----
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
+    .config("spark.hadoop.fs.s3a.access.key", "*")
+    .config("spark.hadoop.fs.s3a.secret.key", "*****")
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")        # required for MinIO
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+    # ---- Iceberg configuration ----
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lakehouse.type", "hadoop")
+    .config("spark.sql.catalog.lakehouse.warehouse", S3_BUCKET)
+    .config("spark.sql.defaultCatalog", "lakehouse")
+    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+        "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+GitHub Copilot: I'll point out the issues and show a minimal corrected snippet you can copy into your notebook.
+
+Key issues / recommendations
+- S3 bucket URI: use a proper s3a URI with trailing slash — e.g. `s3a://warehouse/` (your `S3_BUCKET` should be a URI, not just the bucket name).
+- Credentials: avoid hardcoding; read from env (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) or .env.
+- Endpoint: `http://minio:9000` is fine for `fs.s3a.endpoint`. Some users omit the scheme (both work), but include `fs.s3a.connection.ssl.enabled=false` for HTTP.
+- Iceberg catalog type: `hadoop` is OK if you want Iceberg to use Hadoop/S3A FileIO; with `hadoop` the `warehouse` must be an accessible URI (use `s3a://...`). If you prefer the setup in your README, use the `rest` catalog + `S3FileIO` approach instead.
+- Check keys names: `spark.hadoop.fs.s3a.access.key` and `spark.hadoop.fs.s3a.secret.key` are correct; you also set the `aws.credentials.provider` which is fine.
+
+Minimal corrected snippet (recommended)
+```python
+S3_ENDPOINT = "http://minio:9000"
+S3_WAREHOUSE = "s3a://warehouse/"
+
+spark = (
+    SparkSession.builder
+    .appName("bdm_week04_lakehouse")
+    .master("local[*]")
+    .config("spark.sql.shuffle.partitions", "4")
+
+    # S3 / MinIO (read from env instead of hardcoding)
+    .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
+    .config("spark.hadoop.fs.s3a.access.key", os.environ["AWS_ACCESS_KEY_ID"])
+    .config("spark.hadoop.fs.s3a.secret.key", os.environ["AWS_SECRET_ACCESS_KEY"])
+    .config("spark.hadoop.fs.s3a.path.style.access", "true")
+    .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+    .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
+
+    # Iceberg Hadoop catalog using s3a:// URI
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    .config("spark.sql.catalog.lakehouse", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lakehouse.type", "hadoop")
+    .config("spark.sql.catalog.lakehouse.warehouse", S3_WAREHOUSE)
+    .config("spark.sql.defaultCatalog", "lakehouse")
+    .getOrCreate()
+)
+```
+
+If you prefer the README approach (Iceberg REST + S3FileIO), switch to `type=rest` and configure `lakehouse.io-impl` and MinIO credentials as shown in your README — that is the recommended setup for this project.
+
+User: oops copied wrong config. Correct version: S3_ENDPOINT = "http://minio:9000"
+S3_BUCKET   = "s3a://warehouse"
+
+spark = (
+    SparkSession.builder
+    .appName("project2")
+    .master("local[*]")
+    .config("spark.sql.shuffle.partitions", "4")
+
+    # ── Iceberg ──────────────────────────────────────────────────────────────
+    .config("spark.sql.extensions",
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+    # Catalog named 'lakehouse' — use it as: lakehouse.<database>.<table>
+    .config("spark.sql.catalog.lakehouse",
+            "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.lakehouse.type",      "rest")
+    .config("spark.sql.catalog.lakehouse.uri",       "http://iceberg-rest:8181")
+    .config("spark.sql.catalog.lakehouse.warehouse", S3_BUCKET)
+    # S3FileIO writes data files directly to MinIO
+    .config("spark.sql.catalog.lakehouse.io-impl",
+            "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.lakehouse.s3.endpoint",          S3_ENDPOINT)
+    .config("spark.sql.catalog.lakehouse.s3.path-style-access", "true")
+    .config("spark.sql.catalog.lakehouse.s3.access-key-id",     os.environ["AWS_ACCESS_KEY_ID"])
+    .config("spark.sql.catalog.lakehouse.s3.secret-access-key", os.environ["AWS_SECRET_ACCESS_KEY"])
+    .config("spark.sql.catalog.lakehouse.s3.region", "us-east-1")
+
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+GitHub Copilot: Mostly correct — one tweak:
+
+- When using the REST catalog with `lakehouse.io-impl=org.apache.iceberg.aws.s3.S3FileIO`, the warehouse URI should use the `s3://` scheme (not `s3a://`) and include a trailing slash. Change:
+  - S3_BUCKET = "s3://warehouse/"
+
+Keep the rest as-is (catalog `lakehouse.s3.*` keys, endpoint, and env creds). If instead you want to use Hadoop/S3A FileIO, switch `spark.sql.catalog.lakehouse.type` to `"hadoop"` and use `s3a://` URIs plus the `fs.s3a.*` settings.
+
+Quick verification (run in notebook):
+```python
+spark.sql("CREATE DATABASE IF NOT EXISTS lakehouse.taxi")
+spark.sql("CREATE TABLE IF NOT EXISTS lakehouse.taxi.test (id INT) USING iceberg")
+spark.sql("SHOW TABLES IN lakehouse.taxi").show()
+```
+If those succeed the catalog + S3 config is correct.
+
+User: spark.sql("SHOW TABLES IN lakehouse.taxi").show() does wirj
+
+GitHub Copilot: Quick check — do you see rows returned or an error? If it failed, run these in your notebook and paste the error:
+
+```python
+spark.sql("CREATE TABLE IF NOT EXISTS lakehouse.taxi.test (id INT) USING iceberg")
+spark.sql("SHOW TABLES IN lakehouse.taxi").show()
+```
+
+If that errors, run these diagnostics in a host shell:
+
+```bash
+curl -s http://localhost:8181/health || docker compose logs iceberg-rest --tail 100
+docker compose logs minio --tail 100
+```
+
+Share the exact error output and I’ll suggest the next fix.
+
+User: These did work
+
+GitHub Copilot: Updating the TODOs to add a step for writing the bronze stream to your Iceberg table.
+
+Created 5 todos
+
+Nice — since `lakehouse` works, write the stream directly to the Iceberg table. Example:
+
+```python
+parsed_query = (
+    parsed_df.writeStream
+    .format("iceberg")
+    .outputMode("append")
+    .option("checkpointLocation", "/tmp/chk-bronze-iceberg")
+    .start("lakehouse.taxi.stg_taxi")
+)
+```
+
+Quick notes:
+- Use a unique `checkpointLocation` per streaming query.
+- Use `append` for Bronze; Iceberg will manage file commits.
+- Verify with:
+```python
+spark.sql("SELECT * FROM lakehouse.taxi.stg_taxi LIMIT 10").show(truncate=False)
+```
+
+Want me to mark the new TODO as completed after you confirm the stream is running?
+
+User: Why is my data saved as .parquet? spark.sql("""
+    CREATE OR REPLACE TABLE lakehouse.bronze.stg_taxi (
+        kafka_time TIMESTAMP,
+        key STRING,
+        offset INT,
+        partition INT,
+        value STRING
+    ) USING iceberg
+""")
+
+raw_df.withColumn("kafka_time", F.to_timestamp("kafka_time")).writeTo("lakehouse.bronze.stg_taxi").append()
+
+GitHub Copilot: That's expected — Iceberg is a metadata/table layer; the actual data is written as columnar files (Parquet by default). `writeTo("lakehouse.bronze.stg_taxi").append()` writes Iceberg data files, and Iceberg chooses Parquet unless you tell it otherwise.
+
+To change the file format for new data, set the table property (on create or alter). Example — create with ORC:
+
+```sql
+CREATE OR REPLACE TABLE lakehouse.bronze.stg_taxi (
+  kafka_time TIMESTAMP,
+  key STRING,
+  offset INT,
+  partition INT,
+  value STRING
+) USING iceberg
+TBLPROPERTIES ('write.format.default'='orc');
+```
+
+Or change an existing table:
+
+```sql
+ALTER TABLE lakehouse.bronze.stg_taxi
+SET TBLPROPERTIES ('write.format.default'='orc');
+```
+
+Notes:
+- Changing the property affects subsequent writes only; existing Parquet files remain.
+- You can use `parquet`, `orc`, or `avro` (depending on your Iceberg/Spark setup).
+- Iceberg manages file layout/commits and stores files in the warehouse path (MinIO/S3) — you’ll see `.parquet` files there when Parquet is selected.
+
+User: But I have this requirement: Bronze table exists and contains raw JSON rows
+
+GitHub Copilot: Short answer: nothing's wrong — Iceberg stores data files as Parquet by default, but the table can still contain raw JSON rows (as a `STRING` column). The requirement "Bronze table exists and contains raw JSON rows" usually means the `value` column holds the original JSON string, not that the warehouse stores `.json` files.
+
+Example (create table → stream writes → verify):
+
+```python
+# create Iceberg bronze table with raw JSON column
+spark.sql("""
+CREATE TABLE IF NOT EXISTS lakehouse.bronze.stg_taxi (
+  kafka_time TIMESTAMP,
+  key STRING,
+  offset INT,
+  partition INT,
+  value STRING          -- raw JSON stored here
+) USING iceberg
+""")
+
+# streaming write (append) to Iceberg table
+parsed_df = parsed_df.withColumn("kafka_time", F.to_timestamp("kafka_time"))
+parsed_query = (
+    parsed_df.writeStream
+    .format("iceberg")
+    .outputMode("append")
+    .option("checkpointLocation", "/tmp/chk-bronze-iceberg")
+    .start("lakehouse.bronze.stg_taxi")
+)
+
+# verify the table contains raw JSON strings
+spark.sql("SELECT value FROM lakehouse.bronze.stg_taxi LIMIT 5").show(truncate=False)
+```
+
+If you truly need literal `.json` files in the warehouse (not recommended for Iceberg), write to the JSON file sink instead:
+
+```python
+parsed_df.writeStream.format("json").option("path","/tmp/bronze_json").option("checkpointLocation","/tmp/chk-json").start()
+```
+
+Summary: keep using Iceberg (Parquet files) but ensure the table schema stores the original JSON in the `value` STRING column — that satisfies the requirement. Do you want me to mark the "Write bronze stream to Iceberg table" TODO as completed?
+

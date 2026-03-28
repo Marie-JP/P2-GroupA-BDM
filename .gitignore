@@ -1,0 +1,8 @@
+.ipynb_checkpoints/*
+.venv/*
+data/*
+
+
+.env
+week_03_practice.ipynb
+week_04_practice.ipynb
