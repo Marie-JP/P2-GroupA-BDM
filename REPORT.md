@@ -162,3 +162,5 @@ MINIO_ROOT_USER=admin
 MINIO_ROOT_PASSWORD=p2bdmparool
 JUPYTER_TOKEN=p2bdm
 ```
+
+LLM usage: since copilot in VSC was used (GPT-5 mini), that we don't know how to share the conversation, the conversations were copied to the file LLM-use.txt.
