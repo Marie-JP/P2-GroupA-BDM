@@ -105,7 +105,7 @@ Trigger interval: `5s` - If too big then the microbatches get too big, too small
 
 Output mode: `update` - Allows restarting the sync without having to worry about duplicates. Complete gets slow and expensive for larger tables. Append is not restart duplicate proof.
 
-Watermark: `did not use it` - Wasn't needed
+Watermark: `did not use it` - Wasn't needed as we are not computing any running totals or time-based summaries while the data streams in.
 
 ## 4. Gold table partitioning strategy
 
