@@ -21,10 +21,11 @@ CREATE TABLE IF NOT EXISTS lakehouse.bronze.stg_taxi (
 ```
 ### Silver
 
-All values are taken out from the json object, cleaned and cast into suitable datatypes. PU and DO taxi zones were joined into trip source data. Silver layer data should be ready to use for data engineers.
+All values are taken out from the json object, cleaned, cast into suitable datatypes and deduplicated. PU and DO taxi zones were joined into trip source data. Silver layer data should be ready to use for data engineers.
 
 ```SQL
 CREATE OR REPLACE TABLE lakehouse.silver.fct_taxi_trip (
+    tripID STRING,
     VendorID INT,
     RatecodeID INT,
     PULocationID INT,
@@ -52,6 +53,9 @@ CREATE OR REPLACE TABLE lakehouse.silver.fct_taxi_trip (
     DO_Borough STRING,
     DO_service_zone STRING
 ) USING iceberg
+TBLPROPERTIES (
+        'write.identifier-columns' = 'tripID'
+    )
 ```
 ### Gold
 
@@ -93,7 +97,7 @@ ORDER BY avg_minute_fee DESC
 
 Numberic and string fields were cleaned of nulls. In case of Numeric fields we set them to 0 with the exception of the `total_amount` field which we fill with the sum of all other fee fields when it is missing.
 
- The deduplication on key level happens in bronze layer where we ingest the data. In case when there are 2 messages with the same key, the merge strategy should take care of the duplicate.
+ The deduplication happens in the silver layer in case 1 message is sent and recieved multiple times. For this we created a surrogate primary key from concatenating and then hashing `VendorID + tpep_pickup_datetime + tpep_dropoff_datetime + PULocationID + DOLocationID + total_amount` columns. Then we used a window function to remove trips with the same hash.
 
 The enrichment step is done after cleaning up the taxi trip data. There we do 2 left joins on different keys to add the fields which we also alias appropriately. 
 
@@ -112,17 +116,17 @@ Watermark: `did not use it` - Wasn't needed as we are not computing any running 
 Partitioning by months for faster querying, filtering when only looking at a specific time period. Assuming in a real world case we would have more data than just January and February.
 Also partitioning by PU_Zone because this field is central to the table and will be used often.
 
-![alt text](image.png)
+![alt text](image-4.png)
 
 
 ## 5. Restart proof
 
 Here is the row and duplicate counts before the restart:
-![alt text](image-3.png)
+![alt text](image-1.png)
 
-And here it is after
+And here it is after. Note that the producer kept running.
 
-![alt text](image-5.png)
+![alt text](image-2.png)
 ## 6. Custom scenario
 
 This was done:
@@ -131,7 +135,7 @@ This was done:
 
 Q: "In REPORT.md, query the bronze table to show how rows are distributed across partitions and explain what ordering guarantees this partitioning provides"
 
-![alt text](image-6.png)
+![alt text](image-7.png)
 
 Since all the pickup locations are contained in their partitions, the ordering of taxi trips per pickup location is guaranteed.
 
