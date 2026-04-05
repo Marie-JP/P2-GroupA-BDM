@@ -151,13 +151,13 @@ docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 \
   --create --topic taxi-trips --partitions 6 --replication-factor 1"
 
+# Step 3: Open Jupyter notebook and from there the terminal
+Open Jupyter notebook at: http://localhost:8888/lab/tree/project/project_02.ipynb
 
-# Step 3: Start the producer
+# Step 4: Start the producer in the Jupyter terminal
 python produce.py
 
-# Step 4: Run the pipeline
-Open Jupyter notebook at: http://localhost:8888/lab/tree/project/project_02.ipynb
-Run all cells
+# Step 5: Run all cells in Jupyter notebook
 ```
 
 env values (I know these shouldn't be in git):
